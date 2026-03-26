@@ -1,25 +1,28 @@
 package main
 
 import (
-	"bytes"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"log"
-	"net"
+	"net/netip"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/moby/sys/mountinfo"
 )
 
+const SYS_ETHER_IFACE_FLAG = "0x8843"
+const META_MARK string = "0xdeadbeef"
 const DEFAULT_GATEWAY_IP_ADDR string = "10.138.1.1"
 
 type Jail struct {
-	Name      string
-	Root      string
-	Interface *Epair
-	IpAddr    net.IP
-	Params    map[string]string
+	Name          string
+	Root          string
+	ZfsDatasource string
+	Interface     *Epair
+	IpAddr        netip.Addr
 }
 
 type Epair struct {
@@ -27,29 +30,46 @@ type Epair struct {
 	Host string
 }
 
+type NetstatIface struct {
+	Name    string
+	Address string
+	Flags   string
+}
+
+type NetstatIfaces struct {
+	Interface []NetstatIface
+}
+
+type NetstatStats struct {
+	Statistics NetstatIfaces
+}
+
 func EpairCreate() (*Epair, error) {
-	var stderr bytes.Buffer
-
-	cmd := exec.Command("/sbin/ifconfig", "epair", "create")
-	cmd.Stderr = &stderr
-
-	out, err := cmd.Output()
+	out, err := runCmdOutput("/sbin/ifconfig", "epair", "create")
 	if err != nil {
-		return nil, fmt.Errorf("%v: %v", err, stderr.String())
+		return nil, err
 	}
 
-	north := strings.TrimSuffix(string(out), "\n")
-	if len(north) == 0 {
-		return nil, fmt.Errorf("failed to create epair")
+	north := strings.TrimSpace(string(out))
+	return ImportEpair(north)
+}
+
+func ImportEpair(iface string) (*Epair, error) {
+	if len(iface) == 0 {
+		return nil, fmt.Errorf("invalid epair %v", iface)
+	}
+
+	if !strings.HasPrefix(iface, "epair") {
+		return nil, fmt.Errorf("interface is not epair %v", iface)
 	}
 
 	// north is usually like 'epair0a'
-	south := []rune(north)
+	south := []rune(iface)
 	// so south becomes 'epair0b'
 	south[len(south)-1] = 'b'
 
 	return &Epair{
-		Jail: north,
+		Jail: iface,
 		Host: string(south),
 	}, nil
 }
@@ -58,35 +78,81 @@ func (e *Epair) Delete() error {
 	return runCmd("/sbin/ifconfig", e.Host, "destroy")
 }
 
-func JailCreate(at *AppTemplate, ipAddr net.IP) (*Jail, error) {
-	log.Printf("creating jail %v", at.Name)
-	err := zfsCreateSnapshot("zroot/jails/releases/15.0-RELEASE", "base")
+func netstatFirstEtherIface(jail string) (*NetstatIface, error) {
+	out, err := runCmdOutput("/usr/bin/netstat", "-j", jail, "-i", "-4", "-n", "--libxo", "json")
+	if err != nil {
+		return nil, err
+	}
+
+	var stats NetstatStats
+	err = json.Unmarshal(out, &stats)
+	if err != nil {
+		return nil, err
+	}
+
+	for _, iface := range stats.Statistics.Interface {
+		if iface.Flags == SYS_ETHER_IFACE_FLAG {
+			return &iface, nil
+		}
+	}
+
+	return nil, nil
+}
+
+func JailImport(name string, zfsTree string) (*Jail, error) {
+	zfsSource := fmt.Sprintf("zroot/jails/%s/%s", zfsTree, name)
+	root := filepath.Join(DEFAULT_PREFIX, zfsTree, name)
+
+	out, err := runCmdOutput("/usr/sbin/jls", "-j", name, "meta")
+	if err != nil {
+		return nil, err
+	}
+
+	// not managed by us
+	if strings.TrimSpace(string(out)) != META_MARK {
+		return nil, nil
+	}
+
+	iface, err := netstatFirstEtherIface(name)
+	if err != nil {
+		return nil, err
+	}
+
+	if iface == nil {
+		return nil, fmt.Errorf("could not find ethernet interface of jail %s", name)
+	}
+
+	epair, err := ImportEpair(iface.Name)
+	if err != nil {
+		return nil, err
+	}
+
+	ipAddr, err := netip.ParseAddr(iface.Address)
+	if err != nil {
+		return nil, err
+	}
+
+	return &Jail{
+		Name:          name,
+		Root:          root,
+		ZfsDatasource: zfsSource,
+		Interface:     epair,
+		IpAddr:        ipAddr,
+	}, nil
+}
+
+func JailCreate(zfsTree string, manifest *Manifest, ipAddr netip.Addr) (*Jail, error) {
+	log.Printf("creating jail %s/%s", zfsTree, manifest.Name)
+	err := zfsCreateSnapshot(fmt.Sprintf("zroot/jails/%s", manifest.Base), "base")
 	if err != nil {
 		return nil, err
 	}
 
 	// TODO: what if clone already exists?
-	zfsSource := fmt.Sprintf("zroot/jails/templates/%s", at.Name)
-	err = zfsClone("zroot/jails/releases/15.0-RELEASE@base", zfsSource)
+	zfsSource := fmt.Sprintf("zroot/jails/%s/%s", zfsTree, manifest.Name)
+	err = zfsClone(fmt.Sprintf("zroot/jails/%s@base", manifest.Base), zfsSource)
 	if err != nil {
 		return nil, err
-	}
-
-	params := map[string]string{}
-	for key, value := range at.Jail {
-		switch v := value.(type) {
-		case string:
-			params[key] = v
-		case int:
-		case int32:
-		case int64:
-			params[key] = fmt.Sprintf("%d", v)
-		case []string:
-			params[key] = strings.Join(v, ",")
-
-		default:
-			return nil, fmt.Errorf("unsupported jail directive %v with that type. only string, integer, and list of strings are supported: %v", key, v)
-		}
 	}
 
 	epair, err := EpairCreate()
@@ -95,21 +161,27 @@ func JailCreate(at *AppTemplate, ipAddr net.IP) (*Jail, error) {
 		return nil, err
 	}
 
+	params, err := manifest.Jail.JailParams()
+	if err != nil {
+		return nil, err
+	}
+
 	// remove potentially harmful parameters
 	delete(params, "mount.fstab")
 
 	_, ok := params["host.hostname"]
 	if !ok {
-		params["host.hostname"] = at.Name
+		params["host.hostname"] = manifest.Name
 	}
 
-	root := filepath.Join(DEFAULT_PREFIX, "templates", at.Name)
+	root := filepath.Join(DEFAULT_PREFIX, zfsTree, manifest.Name)
 
-	params["name"] = at.Name
+	params["name"] = manifest.Name
 	params["vnet"] = ""
 	params["vnet.interface"] = epair.Jail
 	params["path"] = root
-	params["exec.consolelog"] = fmt.Sprintf("/var/log/bastille/%s_console.log", at.Name)
+	params["meta"] = META_MARK
+	params["exec.consolelog"] = fmt.Sprintf("/var/log/bastille/%s_console.log", manifest.Name)
 
 	paramStr := []string{"-c"}
 	for key, value := range params {
@@ -128,17 +200,16 @@ func JailCreate(at *AppTemplate, ipAddr net.IP) (*Jail, error) {
 	}
 
 	jail := Jail{
-		Name:      at.Name,
-		Root:      root,
-		Interface: epair,
-		IpAddr:    ipAddr,
-		Params:    params,
+		Name:          manifest.Name,
+		Root:          root,
+		ZfsDatasource: zfsSource,
+		Interface:     epair,
+		IpAddr:        ipAddr,
 	}
 
-	err = jail.InitNetworking()
+	err = jail.initNetworking()
 	if err != nil {
-		// TODO: move this to shutdown?
-		defer zfsDestroy(zfsSource)
+		defer jail.Destroy()
 
 		sErr := jail.Shutdown()
 		if sErr != nil {
@@ -151,23 +222,25 @@ func JailCreate(at *AppTemplate, ipAddr net.IP) (*Jail, error) {
 	return &jail, nil
 }
 
-func (j *Jail) InitNetworking() error {
-	jailCidr := fmt.Sprintf("%s/32", j.IpAddr.To4().String())
-	err := j.Exec("/sbin/ifconfig", j.Interface.Jail, jailCidr)
+func (j *Jail) initNetworking() error {
+	// jail side
+	jailCidr := fmt.Sprintf("%s/32", j.IpAddr.String())
+	err := runCmd("/sbin/ifconfig", "-j", j.Name, j.Interface.Jail, jailCidr)
 	if err != nil {
 		return err
 	}
 
-	err = j.Exec("/sbin/route", "add", "-net", fmt.Sprintf("%s/32", DEFAULT_GATEWAY_IP_ADDR), "-interface", j.Interface.Jail)
+	err = runCmd("/sbin/route", "-j", j.Name, "add", "-net", fmt.Sprintf("%s/32", DEFAULT_GATEWAY_IP_ADDR), "-interface", j.Interface.Jail)
 	if err != nil {
 		return err
 	}
 
-	err = j.Exec("/sbin/route", "add", "default", DEFAULT_GATEWAY_IP_ADDR)
+	err = runCmd("/sbin/route", "-j", j.Name, "add", "default", DEFAULT_GATEWAY_IP_ADDR)
 	if err != nil {
 		return err
 	}
 
+	// host side
 	err = runCmd("/sbin/ifconfig", j.Interface.Host, "inet", fmt.Sprintf("%s/32", DEFAULT_GATEWAY_IP_ADDR))
 	if err != nil {
 		return err
@@ -181,11 +254,21 @@ func (j *Jail) InitNetworking() error {
 func (j *Jail) Shutdown() error {
 	err := runCmd("/usr/sbin/jail", "-r", j.Name)
 
-	_, ok := j.Params["mount.devfs"]
-	if ok {
-		umountErr := runCmd("/sbin/umount", filepath.Join(j.Root, "dev"))
-		if umountErr != nil {
-			err = fmt.Errorf("%v: %v", err, umountErr)
+	mntPrefix := strings.TrimSuffix(j.Root, "/")
+	mounts, mountsErr := mountinfo.GetMounts(mountinfo.PrefixFilter(mntPrefix))
+	if mountsErr != nil {
+		err = fmt.Errorf("%v: %v", err, mountsErr)
+	} else {
+		for _, mnt := range mounts {
+			if strings.TrimSuffix(mnt.Mountpoint, "/") == mntPrefix {
+				continue
+			}
+
+			log.Printf("shutdown: umounting %v", mnt.Mountpoint)
+			umountErr := runCmd("/sbin/umount", mnt.Mountpoint)
+			if umountErr != nil {
+				err = fmt.Errorf("%v: %v", err, umountErr)
+			}
 		}
 	}
 
@@ -193,6 +276,12 @@ func (j *Jail) Shutdown() error {
 	if epairErr != nil {
 		err = fmt.Errorf("%v: %v", err, epairErr)
 	}
+
+	return err
+}
+
+func (j *Jail) Destroy() error {
+	err := zfsDestroy(j.ZfsDatasource)
 
 	return err
 }
