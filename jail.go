@@ -23,6 +23,7 @@ type Jail struct {
 	ZfsDatasource string
 	Interface     *Epair
 	IpAddr        netip.Addr
+	Mounts        []string
 }
 
 type Epair struct {
@@ -132,12 +133,33 @@ func JailImport(name string, zfsTree string) (*Jail, error) {
 		return nil, err
 	}
 
+	mntPrefix := strings.TrimSuffix(root, "/")
+	jailMounts, err := mountinfo.GetMounts(mountinfo.PrefixFilter(mntPrefix))
+
+	if err != nil {
+		return nil, err
+	}
+
+	mounts := []string{}
+	volumesPath := filepath.Join(DEFAULT_PREFIX, "volumes")
+	for _, mnt := range jailMounts {
+		if strings.TrimSuffix(mnt.Mountpoint, "/") == mntPrefix {
+			continue
+		}
+
+		if strings.HasPrefix(mnt.Source, volumesPath) && mnt.FSType == "nullfs" {
+			vol := strings.TrimPrefix(mnt.Source, fmt.Sprintf("%s/", volumesPath))
+			mounts = append(mounts, vol)
+		}
+	}
+
 	return &Jail{
 		Name:          name,
 		Root:          root,
 		ZfsDatasource: zfsSource,
 		Interface:     epair,
 		IpAddr:        ipAddr,
+		Mounts:        mounts,
 	}, nil
 }
 
@@ -199,12 +221,19 @@ func JailCreate(zfsTree string, manifest *Manifest, ipAddr netip.Addr) (*Jail, e
 		return nil, err
 	}
 
+	mounts := []string{}
+
+	for _, mnt := range manifest.Mounts {
+		mounts = append(mounts, mnt.Volume)
+	}
+
 	jail := Jail{
 		Name:          manifest.Name,
 		Root:          root,
 		ZfsDatasource: zfsSource,
 		Interface:     epair,
 		IpAddr:        ipAddr,
+		Mounts:        mounts,
 	}
 
 	err = jail.initNetworking()
@@ -385,6 +414,44 @@ func (j *Jail) Copy(src, dst, owner, group string, modeStr string) error {
 		if err != nil {
 			return err
 		}
+	}
+
+	return nil
+}
+
+// caller should verify whether [`src`] is "trusted"
+// callee does verify whether [`dst`] are within jail bounds
+func (j *Jail) Mount(src, dst, owner, group, modeStr string) error {
+	hostDestPath := safePathJoin(j.Root, dst)
+	if len(hostDestPath) == 0 {
+		return fmt.Errorf("invalid mount dst path: can not mount outside jail root: %s", dst)
+	}
+
+	mode, err := strconv.ParseUint(modeStr, 8, 32)
+	if err != nil {
+		return err
+	}
+
+	err = os.Mkdir(hostDestPath, os.FileMode(mode))
+	if err != nil {
+		if !os.IsExist(err) {
+			return err
+		}
+	}
+
+	err = runCmd("/sbin/mount", "-t", "nullfs", "-o", "nosuid,noexec,nodev", src, hostDestPath)
+	if err != nil {
+		return err
+	}
+
+	err = j.Exec("chmod", modeStr, dst)
+	if err != nil {
+		return err
+	}
+
+	err = j.Exec("chown", fmt.Sprintf("%s:%s", owner, group), dst)
+	if err != nil {
+		return err
 	}
 
 	return nil

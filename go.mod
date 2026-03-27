@@ -6,6 +6,7 @@ require (
 	github.com/go-git/go-git/v6 v6.0.0-20260324221343-cd85c8c75d34
 	github.com/pelletier/go-toml/v2 v2.3.0
 	golang.org/x/mod v0.34.0
+	github.com/moby/sys/mountinfo v0.7.2
 )
 
 require (
@@ -19,11 +20,10 @@ require (
 	github.com/golang/groupcache v0.0.0-20241129210726-2c02b8208cf8 // indirect
 	github.com/kevinburke/ssh_config v1.5.0 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
-	github.com/moby/sys/mountinfo v0.7.2 // indirect
 	github.com/pjbgf/sha1cd v0.5.0 // indirect
 	github.com/sergi/go-diff v1.4.0 // indirect
 	golang.org/x/crypto v0.48.0 // indirect
 	golang.org/x/net v0.50.0 // indirect
 	golang.org/x/sync v0.19.0 // indirect
-	golang.org/x/sys v0.41.0 // indirect
+	golang.org/x/sys v0.42.0 // indirect
 )
