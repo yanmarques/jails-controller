@@ -85,6 +85,8 @@ type Manifest struct {
 	Base    string
 	Jail    JailUserConf
 	Actions []JailAction
+
+	OriginalHostPath string
 }
 
 type IPSlot struct {
@@ -269,26 +271,23 @@ func zfsCreate(filesystem string, mountpoint string) error {
 	return nil
 }
 
-func copyFile(src, dest string) error {
+func copyFile(src, dest string, perm os.FileMode) error {
 	srcFile, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer srcFile.Close()
 
-	baseDir := filepath.Dir(dest)
-	if baseDir != "." && baseDir != string(os.PathSeparator) {
-		err = os.MkdirAll(baseDir, 0755)
-		if err != nil && !os.IsExist(err) {
-			return err
-		}
-	}
-
 	destFile, err := os.Create(dest)
 	if err != nil {
 		return err
 	}
 	defer destFile.Close()
+
+	err = os.Chmod(dest, perm)
+	if err != nil {
+		return err
+	}
 
 	_, err = io.Copy(destFile, srcFile)
 	return err
@@ -365,6 +364,16 @@ func (i *IPManager) Import(ipAddr netip.Addr) error {
 	return nil
 }
 
+func safePathJoin(base string, untrusted string) string {
+	base = filepath.Clean(base)
+	path := filepath.Join(base, untrusted)
+	if !strings.HasPrefix(path, base) {
+		return ""
+	}
+
+	return path
+}
+
 func (m Manifest) PrepareJail(jail *Jail) error {
 	for _, action := range m.Actions {
 		switch action.Type {
@@ -374,7 +383,12 @@ func (m Manifest) PrepareJail(jail *Jail) error {
 				return err
 			}
 		case "copy":
-			err := jail.Copy(action.Src, action.Dest, action.Owner, action.Group, action.Mode)
+			path := safePathJoin(m.OriginalHostPath, action.Src)
+			if len(path) == 0 {
+				return fmt.Errorf("invalid copy src path: can not copy outside manifest path: %s", action.Src)
+			}
+
+			err := jail.Copy(path, action.Dest, action.Owner, action.Group, action.Mode)
 			if err != nil {
 				return err
 			}
@@ -462,12 +476,6 @@ func (r *Reconciler) Reconcile() {
 	if err != nil {
 		if os.IsNotExist(err) {
 			log.Println("repository doesn't have images")
-			// sPath := path.Join(DEFAULT_BASTILLE_PREFIX, "templates", DEFAULT_TEMPLATE_ORG)
-			// log.Printf("removing templates symlink from %v", sPath)
-			// err = os.Remove(sPath)
-			// if !os.IsNotExist(err) {
-			// 	oops.Err(err)
-			// }
 		} else {
 			oops.Err(err)
 		}
@@ -499,40 +507,36 @@ func (r *Reconciler) Reconcile() {
 
 				for _, entry := range entries {
 					if entry.IsDir() {
-						t := filepath.Join(repoImgPath, entry.Name(), "image.conf")
-						_, err = os.Stat(t)
+						imgPath := filepath.Join(repoImgPath, entry.Name())
+						content, err := os.ReadFile(filepath.Join(imgPath, "image.conf"))
 						if err != nil {
 							if !os.IsNotExist(err) {
 								oops.Err(err)
 							}
 						} else {
-							content, err := os.ReadFile(t)
+							var m Manifest
+
+							err = toml.Unmarshal(content, &m)
 							if err != nil {
 								oops.Err(err)
-							} else {
-								var m Manifest
-
-								err = toml.Unmarshal(content, &m)
-								if err != nil {
-									oops.Err(err)
-									break
-								}
-
-								if len(m.Name) == 0 {
-									oops.Err(fmt.Errorf(
-										"manifest with empty image name, ignoring: %v",
-										filepath.Join(repoImgPath, entry.Name())))
-									break
-								}
-
-								_, ok := desiredImages[m.Name]
-								if ok {
-									oops.Err(fmt.Errorf("duplicate image name definitions: %s, aborting", m.Name))
-									return
-								}
-
-								desiredImages[m.Name] = m
+								break
 							}
+
+							if len(m.Name) == 0 {
+								oops.Err(fmt.Errorf(
+									"manifest with empty image name, ignoring: %v",
+									filepath.Join(repoImgPath, entry.Name())))
+								break
+							}
+
+							_, ok := desiredImages[m.Name]
+							if ok {
+								oops.Err(fmt.Errorf("duplicate image name definitions: %s, aborting", m.Name))
+								return
+							}
+
+							m.OriginalHostPath = imgPath
+							desiredImages[m.Name] = m
 						}
 					}
 				}
@@ -620,6 +624,7 @@ func (r *Reconciler) Reconcile() {
 					return fmt.Errorf("duplicate jail name definitions: %s, aborting", jail.Name)
 				}
 
+				jail.OriginalHostPath = filepath.Dir(path)
 				desiredJails[jail.Name] = jail
 			}
 
@@ -795,7 +800,7 @@ func main() {
 			log.Fatal(err)
 		}
 
-		err := copyFile("/etc/resolv.conf", filepath.Join(releasePath, "etc/resolv.conf"))
+		err := copyFile("/etc/resolv.conf", filepath.Join(releasePath, "etc/resolv.conf"), os.FileMode(0644))
 		if err != nil {
 			log.Fatal(err)
 		}

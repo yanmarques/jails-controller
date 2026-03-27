@@ -3,11 +3,11 @@ package main
 import (
 	"encoding/json"
 	"fmt"
-	"io/fs"
 	"log"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/moby/sys/mountinfo"
@@ -296,19 +296,29 @@ func (j *Jail) Exec(command string, args ...string) error {
 	return runCmd("/usr/sbin/jexec", a...)
 }
 
-func (j *Jail) Copy(src, dst, owner, group, mode string) error {
+// caller should verify whether [`src`] is "trusted"
+// callee does verify whether [`dst`] are within jail bounds
+func (j *Jail) Copy(src, dst, owner, group string, modeStr string) error {
 	srcStat, err := os.Stat(src)
 	if err != nil {
 		return err
 	}
 
-	hostDestPath := filepath.Join(j.Root, dst)
+	hostDestPath := safePathJoin(j.Root, dst)
+	if len(hostDestPath) == 0 {
+		return fmt.Errorf("invalid copy dst path: can not copy outside jail root: %s", dst)
+	}
 
 	dstStat, err := os.Stat(hostDestPath)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			return err
 		}
+	}
+
+	mode, err := strconv.ParseUint(modeStr, 8, 32)
+	if err != nil {
+		return err
 	}
 
 	if !srcStat.IsDir() {
@@ -318,10 +328,13 @@ func (j *Jail) Copy(src, dst, owner, group, mode string) error {
 
 		if dstStat != nil && dstStat.IsDir() {
 			dst = filepath.Join(dst, filepath.Base(src))
-			hostDestPath = filepath.Join(j.Root, dst)
+			hostDestPath = safePathJoin(j.Root, dst)
+			if len(hostDestPath) == 0 {
+				return fmt.Errorf("invalid copy dst path: can not copy outside jail root: %s", dst)
+			}
 		}
 
-		err = copyFile(src, hostDestPath)
+		err = copyFile(src, hostDestPath, os.FileMode(mode))
 		if err != nil {
 			return err
 		}
@@ -331,40 +344,48 @@ func (j *Jail) Copy(src, dst, owner, group, mode string) error {
 			return err
 		}
 
-		err = j.Exec("chmod", mode, dst)
-		if err != nil {
-			return err
-		}
+		return nil
 	}
 
-	if dstStat != nil && !dstStat.IsDir() {
+	if dstStat == nil {
+		return fmt.Errorf("copy destination directory must exist in the jail: %v", dst)
+	}
+
+	if !dstStat.IsDir() {
 		return fmt.Errorf("copy destination must be a directory when src is also a directory")
 	}
 
-	return filepath.WalkDir(src, func(path string, entry fs.DirEntry, err error) error {
+	entries, err := os.ReadDir(src)
+
+	for _, entry := range entries {
+		path := filepath.Join(src, entry.Name())
+
+		log.Printf("copy: walkdir path: %v", path)
+		if !entry.Type().IsRegular() {
+			continue
+		}
+
+		if entry.IsDir() {
+			continue
+		}
+
+		destPath := filepath.Join(hostDestPath, entry.Name())
+		// this shouldn't happen, but...
+		if !strings.HasPrefix(destPath, j.Root) {
+			return fmt.Errorf("invalid copy dst path: can not copy outside jail root: %s",
+				destPath)
+		}
+
+		err = copyFile(path, destPath, os.FileMode(mode))
 		if err != nil {
 			return err
 		}
 
-		if entry.Type().IsRegular() && !entry.IsDir() {
-			destPath := filepath.Join(hostDestPath, path)
-
-			err = copyFile(path, destPath)
-			if err != nil {
-				return err
-			}
-
-			err = j.Exec("chown", fmt.Sprintf("%s:%s", owner, group), filepath.Join(dst, path))
-			if err != nil {
-				return err
-			}
-
-			err = j.Exec("chmod", mode, filepath.Join(dst, path))
-			if err != nil {
-				return err
-			}
+		err = j.Exec("chown", fmt.Sprintf("%s:%s", owner, group), filepath.Join(dst, entry.Name()))
+		if err != nil {
+			return err
 		}
+	}
 
-		return nil
-	})
+	return nil
 }
