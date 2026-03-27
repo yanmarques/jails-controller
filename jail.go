@@ -183,7 +183,7 @@ func JailCreate(zfsTree string, manifest *Manifest, ipAddr netip.Addr) (*Jail, e
 		return nil, err
 	}
 
-	params, err := manifest.Jail.JailParams()
+	params, err := manifest.Params.JailParams()
 	if err != nil {
 		return nil, err
 	}
