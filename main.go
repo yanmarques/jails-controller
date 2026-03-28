@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -28,11 +27,7 @@ import (
 	"golang.org/x/mod/semver"
 )
 
-const DEFAULT_PREFIX string = "/usr/local/jails"
 const DEFAULT_CONFIG_PATH = "/usr/local/etc/bastille-poller.json"
-const DEFAULT_IMAGE_CONF = "image.conf"
-const DEFAULT_JAIL_CONF = "jail.conf"
-const DEFAULT_VOLUME_CONF = "volume.conf"
 const DEFAULT_IMAGE_CIDR = "10.100.0.0/16"
 const DEFAULT_JAIL_CIDR = "10.200.0.0/16"
 
@@ -44,6 +39,7 @@ type Reconciler struct {
 	ImageIpam *IPManager
 	JailIpam  *IPManager
 	Config    Config
+	Zfs       *Zfs
 }
 
 type ErrAggregator struct {
@@ -60,7 +56,9 @@ type Config struct {
 	// How long to wait between fetching attempts
 	PollInterval int
 	// Path to the directory where the repository will be cloned
-	Directory string
+	Directory     string
+	ZfsRoot       string
+	ZfsMountpoint string
 }
 
 type State struct {
@@ -131,12 +129,6 @@ type IPManager struct {
 	Network netip.Prefix
 }
 
-type ZfsCreateOptions struct {
-	Filesystem string
-	Mountpoint string
-	QuotaSize  int
-}
-
 func NewState() *State {
 	return &State{
 		Jails:   map[string]*Jail{},
@@ -184,29 +176,29 @@ func (c JailUserParams) JailParams() (JailParams, error) {
 }
 
 func runCmd(command string, args ...string) error {
-	out, err := exec.Command(command, args...).CombinedOutput()
+	stdout, err := exec.Command(command, args...).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("%v: %v: %v %v", err, strings.TrimSpace(string(out)), command, args)
+		return fmt.Errorf("%v: %v: %v %v", err, strings.TrimSpace(string(stdout)), command, args)
 	}
 
 	return nil
 }
 
-func runCmdOutput(command string, args ...string) ([]byte, error) {
+func runCmdOutput(command string, args ...string) ([]byte, []byte, error) {
 	var stderr bytes.Buffer
 	cmd := exec.Command(command, args...)
 	cmd.Stderr = &stderr
 
-	out, err := cmd.Output()
+	stdout, err := cmd.Output()
 	if err != nil {
-		return nil, fmt.Errorf("%v: stdout=%v stderr=%v: %v %v",
-			err, strings.TrimSpace(string(out)), strings.TrimSpace(stderr.String()), cmd.Path, cmd.Args)
+		return stdout, stderr.Bytes(), fmt.Errorf("%v: stdout=%v stderr=%v: %v %v",
+			err, strings.TrimSpace(string(stdout)), strings.TrimSpace(stderr.String()), cmd.Path, cmd.Args)
 	}
 
-	return out, nil
+	return stdout, stderr.Bytes(), nil
 }
 func jailListAll() (map[string]bool, error) {
-	out, err := runCmdOutput("/usr/sbin/jls", "name")
+	out, _, err := runCmdOutput("/usr/sbin/jls", "name")
 	if err != nil {
 		return nil, err
 	}
@@ -221,129 +213,6 @@ func jailListAll() (map[string]bool, error) {
 	}
 
 	return jails, nil
-}
-
-func zfsClone(snapshot string, dest string) error {
-	out, err := exec.Command("/sbin/zfs", "list", "-t", "snapshot", snapshot).CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("no such snapshot: %v: %v", snapshot, err)
-	}
-
-	out, err = exec.Command("/sbin/zfs", "clone", snapshot, dest).CombinedOutput()
-	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			if exitErr.ExitCode() == 1 && strings.Contains(string(out), "dataset already exists") {
-				return &os.PathError{
-					Op:   "clone",
-					Path: dest,
-					Err:  os.ErrExist,
-				}
-			}
-		}
-
-		return fmt.Errorf("%v: %v", err, string(out))
-	}
-
-	return nil
-}
-
-func zfsCreateSnapshot(filesystem string, name string) error {
-	out, err := exec.Command("/sbin/zfs", "snapshot", fmt.Sprintf("%s@%s", filesystem, name)).CombinedOutput()
-	if err != nil {
-		var exitErr *exec.ExitError
-
-		if errors.As(err, &exitErr) {
-			if exitErr.ExitCode() == 1 && strings.Contains(string(out), "dataset already exists") {
-				return nil
-			}
-		}
-
-		return fmt.Errorf("%v: %v", err, string(out))
-	}
-
-	return nil
-}
-
-func zfsDestroy(filesystem string) error {
-	return runCmd("/sbin/zfs", "destroy", filesystem)
-}
-
-func zfsListFilesystems(root string) (map[string]*VolumeManifest, error) {
-	out, err := runCmdOutput("/sbin/zfs", "list", "-o", "name,quota", "-t", "filesystem", "-H", "-d", "1", "-r", root)
-	if err != nil {
-		return nil, err
-	}
-
-	volumes := map[string]*VolumeManifest{}
-	rootSlash := fmt.Sprintf("%s/", strings.TrimSuffix(root, "/"))
-
-	stdout := strings.TrimSpace(string(out))
-	for line := range strings.SplitSeq(stdout, "\n") {
-		elements := strings.SplitN(line, "\t", 2)
-		if elements[0] != root {
-			volName := strings.TrimPrefix(elements[0], rootSlash)
-			maxSize := elements[1]
-
-			quota, err := volumeSize(maxSize)
-			if err != nil {
-				return nil, err
-			}
-
-			volumes[volName] = &VolumeManifest{
-				Name:    volName,
-				MaxSize: maxSize,
-				quota:   quota,
-			}
-		}
-	}
-
-	return volumes, nil
-}
-
-func zfsSet(options *ZfsCreateOptions) error {
-	args := []string{
-		"set",
-	}
-	if options.QuotaSize > 0 {
-		args = append(args, fmt.Sprintf("quota=%dG", options.QuotaSize))
-	}
-
-	args = append(args, options.Filesystem)
-
-	return runCmd("/sbin/zfs", args...)
-}
-
-func zfsCreate(options *ZfsCreateOptions) error {
-	args := []string{
-		"create",
-	}
-	if len(options.Mountpoint) > 0 {
-		args = append(args, "-o")
-		args = append(args, fmt.Sprintf("mountpoint=%s", options.Mountpoint))
-	}
-
-	if options.QuotaSize > 0 {
-		args = append(args, "-o")
-		args = append(args, fmt.Sprintf("quota=%dG", options.QuotaSize))
-	}
-
-	args = append(args, options.Filesystem)
-
-	out, err := exec.Command("/sbin/zfs", args...).CombinedOutput()
-	if err != nil {
-		var exitErr *exec.ExitError
-
-		if errors.As(err, &exitErr) {
-			if exitErr.ExitCode() == 1 && strings.Contains(string(out), "dataset already exists") {
-				return nil
-			}
-		}
-
-		return fmt.Errorf("%v: %v", err, string(out))
-	}
-
-	return nil
 }
 
 func copyFile(src, dest string, perm os.FileMode) error {
@@ -477,10 +346,25 @@ func safePathJoin(base string, untrusted ...string) string {
 }
 
 func PrepareJail(jail *Jail, hostPath string, actions []JailAction, mounts []JailMount, config Config) error {
+	// TODO: check for volume existance prior to this
+	for _, mnt := range mounts {
+		src := safePathJoin(config.ZfsMountpoint, "volumes", mnt.Volume)
+		if len(src) == 0 {
+			return fmt.Errorf("invalid mount src path: can not mount outside jail path: %s", mnt.Volume)
+		}
+
+		err := jail.Mount(src, mnt.Dest, mnt.Owner, mnt.Group, mnt.Mode)
+		if err != nil {
+			return err
+		}
+	}
+
 	for _, action := range actions {
 		switch action.Type {
 		case "exec":
+			log.Printf("running action %s %v", action.Command, action.Args)
 			err := jail.Exec(action.Command, action.Args...)
+			log.Printf("action ended %s %v", action.Command, action.Args)
 			if err != nil {
 				return err
 			}
@@ -496,19 +380,6 @@ func PrepareJail(jail *Jail, hostPath string, actions []JailAction, mounts []Jai
 			}
 		default:
 			return fmt.Errorf("unknown action type: %v", action.Type)
-		}
-	}
-
-	// TODO: check for volume existance prior to this
-	for _, mnt := range mounts {
-		src := safePathJoin(DEFAULT_PREFIX, "volumes", mnt.Volume)
-		if len(src) == 0 {
-			return fmt.Errorf("invalid mount src path: can not mount outside jail path: %s", mnt.Volume)
-		}
-
-		err := jail.Mount(src, mnt.Dest, mnt.Owner, mnt.Group, mnt.Mode)
-		if err != nil {
-			return err
 		}
 	}
 
@@ -622,7 +493,13 @@ func (r *Reconciler) decodeFile(path string, content []byte, desiredState *Desir
 	var volume VolumeManifest
 	volumeErr := decoder.Decode(&volume)
 	if volumeErr != nil {
-		return fmt.Errorf("file %s does not seem to be a valid manifest for jail, image or volume: %v: %v", path, err, volumeErr)
+		var strictErr *toml.StrictMissingError
+
+		if errors.As(err, &strictErr) {
+			return fmt.Errorf("file %s: %s", path, strictErr.String())
+		}
+
+		return fmt.Errorf("file %s does not seem to be a valid manifest for jail, image or volume, check for typos: %v", path, err)
 	}
 
 	return desiredState.addVolume(path, &volume)
@@ -771,84 +648,8 @@ func (r *Reconciler) Reconcile() {
 		}
 	}
 
-	// create images
-	for name, manifest := range desiredState.Images {
-		_, ok := r.State.Images[name]
-		if ok {
-			continue
-		}
-
-		ipAddr, err := r.ImageIpam.AllocateIP()
-		if err != nil {
-			oops.Err(err)
-			break
-		}
-
-		defer r.ImageIpam.Free(*ipAddr)
-
-		jail, err := JailCreate("images", manifest, *ipAddr)
-		if err != nil {
-			oops.Err(err)
-			break
-		}
-
-		oops.Err(PrepareJail(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts, r.Config))
-
-		oops.Err(jail.Shutdown())
-
-		r.State.Images[name] = name
-	}
-
-	// destroy images
-	for _, image := range r.State.Images {
-		_, alive := desiredState.Images[image]
-		if alive {
-			continue
-		}
-
-		oops.Err(zfsDestroy(fmt.Sprintf("zroot/jails/images/%s@base", image)))
-		oops.Err(zfsDestroy(fmt.Sprintf("zroot/jails/images/%s", image)))
-
-		delete(r.State.Images, image)
-	}
-
-	// create volumes
-	for volName, vol := range desiredState.Volumes {
-		_, exists := r.State.Volumes[volName]
-		if exists {
-			if r.State.Volumes[volName].quota == -1 {
-				oops.Err(fmt.Errorf(
-					`volume %s have unlimeted size, this shouldn't happen, it was likely created from the outside.
-						not a good idea to change it's quota size`,
-					volName))
-				break
-			}
-
-			if vol.quota < r.State.Volumes[volName].quota {
-				oops.Err(fmt.Errorf(
-					"volume %s max size %v can not be lower than current size %v",
-					volName, vol.quota, r.State.Volumes[volName].quota))
-				break
-			}
-
-			if vol.quota > r.State.Volumes[volName].quota {
-				err = zfsSet(&ZfsCreateOptions{
-					Filesystem: fmt.Sprintf("zroot/jails/volumes/%s", volName),
-					QuotaSize:  vol.quota,
-				})
-			}
-		} else {
-			err = zfsCreate(&ZfsCreateOptions{
-				Filesystem: fmt.Sprintf("zroot/jails/volumes/%s", volName),
-				QuotaSize:  vol.quota,
-			})
-		}
-
-		if err != nil {
-			oops.Err(err)
-			return
-		}
-	}
+	// order of creation: images, volumes, jails
+	// order of deletion: jails, volumes, images
 
 	volumesToDestroy := []*VolumeManifest{}
 
@@ -893,24 +694,141 @@ func (r *Reconciler) Reconcile() {
 		}
 	}
 
-	// destroy
+	log.Printf("jails to create %v, existing jails %v", len(jailstoCreate), len(r.State.Jails))
+
+	// destroy jails
 	for _, jail := range jailstoDestroy {
-		oops.Err(jail.Shutdown())
-		oops.Err(jail.Destroy())
 		oops.Err(r.JailIpam.Free(jail.IpAddr))
 
-		delete(r.State.Jails, jail.Name)
+		err = oops.Err(jail.Shutdown())
+		if err != nil {
+			continue
+		}
+
+		err = oops.Err(jail.Destroy())
+		if err == nil {
+			delete(r.State.Jails, jail.Name)
+		}
 	}
 
-	// create
+	// destroy volumes
+	for _, vol := range volumesToDestroy {
+		claims, ok := volumeClaims[vol.Name]
+		if ok {
+			oops.Err(fmt.Errorf("can not destroy volume %s because is claimed by %v", vol.Name, claims))
+			continue
+		}
+
+		log.Printf("destroying volume %s", vol.Name)
+		err = oops.Err(r.Zfs.Destroy("volumes/"+vol.Name, true))
+		if err == nil {
+			delete(r.State.Volumes, vol.Name)
+		}
+	}
+
+	// destroy images
+	for _, image := range r.State.Images {
+		_, alive := desiredState.Images[image]
+		if alive {
+			continue
+		}
+
+		err = oops.Err(r.Zfs.Destroy("images/"+image+"@base", true))
+		if err != nil {
+			continue
+		}
+
+		err = oops.Err(r.Zfs.Destroy("images/"+image, true))
+		if err != nil {
+			continue
+		}
+
+		delete(r.State.Images, image)
+	}
+
+	// create images
+	for name, manifest := range desiredState.Images {
+		_, ok := r.State.Images[name]
+		if ok {
+			continue
+		}
+
+		ipAddr, err := r.ImageIpam.AllocateIP()
+		if err != nil {
+			oops.Err(err)
+			break
+		}
+
+		defer r.ImageIpam.Free(*ipAddr)
+
+		jail, err := JailCreate(manifest, r.Zfs, r.Config.ZfsMountpoint, "images", *ipAddr)
+		if err != nil {
+			oops.Err(err)
+			break
+		}
+
+		err = oops.Err(PrepareJail(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts, r.Config))
+
+		oops.Err(jail.Shutdown())
+		if err != nil {
+			jail.Destroy()
+		} else {
+			r.State.Images[name] = name
+		}
+	}
+
+	// create volumes
+	for volName, vol := range desiredState.Volumes {
+		_, exists := r.State.Volumes[volName]
+		if exists {
+			if r.State.Volumes[volName].quota == -1 {
+				oops.Err(fmt.Errorf(
+					`volume %s have unlimeted size, this shouldn't happen, it was likely created from the outside.
+						not a good idea to change it's quota size`,
+					volName))
+				break
+			}
+
+			if vol.quota < r.State.Volumes[volName].quota {
+				oops.Err(fmt.Errorf(
+					"volume %s max size %v can not be lower than current size %v",
+					volName, vol.quota, r.State.Volumes[volName].quota))
+				break
+			}
+
+			if vol.quota > r.State.Volumes[volName].quota {
+				err = r.Zfs.Set(&ZfsCreateOptions{
+					Filesystem: "volumes/" + volName,
+					QuotaSize:  vol.quota,
+				})
+			}
+		} else {
+			err = r.Zfs.Create(&ZfsCreateOptions{
+				Filesystem: "volumes/" + volName,
+				QuotaSize:  vol.quota,
+			})
+			if err == nil {
+				r.State.Volumes[vol.Name] = vol
+			}
+		}
+
+		if err != nil {
+			oops.Err(err)
+			return
+		}
+	}
+
+	// create jails
 	for _, manifest := range jailstoCreate {
+		log.Printf("jails will be created %v", manifest.Name)
+
 		ipAddr, err := r.JailIpam.AllocateIP()
 		if err != nil {
 			oops.Err(err)
 			break
 		}
 
-		jail, err := JailCreate("containers", manifest, *ipAddr)
+		jail, err := JailCreate(manifest, r.Zfs, r.Config.ZfsMountpoint, "containers", *ipAddr)
 		if err != nil {
 			r.JailIpam.Free(*ipAddr)
 			oops.Err(err)
@@ -936,19 +854,6 @@ func (r *Reconciler) Reconcile() {
 		}
 	}
 
-	for _, vol := range volumesToDestroy {
-		claims, ok := volumeClaims[vol.Name]
-		if ok {
-			oops.Err(fmt.Errorf("can not destroy volume %s because is claimed by %v", vol.Name, claims))
-			continue
-		}
-
-		log.Printf("destroying volume %s", vol.Name)
-		oops.Err(zfsDestroy(fmt.Sprintf("zroot/jails/volumes/%s", vol.Name)))
-
-		delete(r.State.Volumes, vol.Name)
-	}
-
 	r.State.LastTag = currentGitTag.Hash.String()
 }
 
@@ -968,7 +873,7 @@ func main() {
 	}
 
 	var config Config
-	err = json.Unmarshal(content, &config)
+	err = toml.Unmarshal(content, &config)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -1014,46 +919,54 @@ func main() {
 		}
 	}
 
-	err = zfsCreate(&ZfsCreateOptions{
-		Filesystem: "zroot/jails",
-		Mountpoint: DEFAULT_PREFIX,
+	zfs := NewZfs(config.ZfsRoot)
+
+	err = zfs.Create(&ZfsCreateOptions{
+		Filesystem: "/",
+		Mountpoint: config.ZfsMountpoint,
+		ExistOk:    true,
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	err = zfsCreate(&ZfsCreateOptions{
-		Filesystem: "zroot/jails/media",
+	err = zfs.Create(&ZfsCreateOptions{
+		Filesystem: "media",
+		ExistOk:    true,
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	err = zfsCreate(&ZfsCreateOptions{
-		Filesystem: "zroot/jails/releases",
+	err = zfs.Create(&ZfsCreateOptions{
+		Filesystem: "releases",
+		ExistOk:    true,
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	err = zfsCreate(&ZfsCreateOptions{
-		Filesystem: "zroot/jails/images",
+	err = zfs.Create(&ZfsCreateOptions{
+		Filesystem: "images",
+		ExistOk:    true,
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
-	err = zfsCreate(&ZfsCreateOptions{
-		Filesystem: "zroot/jails/containers",
+	err = zfs.Create(&ZfsCreateOptions{
+		Filesystem: "containers",
+		ExistOk:    true,
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	err = zfsCreate(&ZfsCreateOptions{
-		Filesystem: "zroot/jails/volumes",
+	err = zfs.Create(&ZfsCreateOptions{
+		Filesystem: "volumes",
+		ExistOk:    true,
 	})
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	basetxz := filepath.Join(DEFAULT_PREFIX, "media/15.0-RELEASE-base.txz")
+	basetxz := filepath.Join(config.ZfsMountpoint, "media/15.0-RELEASE-base.txz")
 	_, err = os.Stat(basetxz)
 	if err != nil {
 		if !os.IsNotExist(err) {
@@ -1066,15 +979,16 @@ func main() {
 		}
 	}
 
-	releasePath := filepath.Join(DEFAULT_PREFIX, "releases/15.0-RELEASE")
+	releasePath := filepath.Join(config.ZfsMountpoint, "releases/15.0-RELEASE")
 	_, err = os.Stat(releasePath)
 	if err != nil {
 		if !os.IsNotExist(err) {
 			log.Fatal(err)
 		}
 
-		err = zfsCreate(&ZfsCreateOptions{
-			Filesystem: "zroot/jails/releases/15.0-RELEASE",
+		err = zfs.Create(&ZfsCreateOptions{
+			Filesystem: "releases/15.0-RELEASE",
+			ExistOk:    true,
 		})
 		if err != nil {
 			log.Fatal(err)
@@ -1095,47 +1009,50 @@ func main() {
 			log.Fatal(err)
 		}
 
-		zfsCreateSnapshot("zroot/jails/releases/15.0-RELEASE", "base")
+		zfs.CreateSnapshot("releases/15.0-RELEASE", "base", true)
 	}
 
 	state := NewState()
-	reconciler := &Reconciler{
-		State:     state,
-		ImageIpam: imageIpam,
-		JailIpam:  jailIpam,
-		Config:    config,
-		Repo:      repo,
-	}
-
 	existingJails, err := jailListAll()
 	if err != nil {
 		log.Fatal(err)
 	}
 
+	log.Printf("existing jails %v", len(existingJails))
+
+	hadErrors := false
 	for name := range existingJails {
-		jail, err := JailImport(name, "containers")
+		jail, err := JailImport(name, zfs, config.ZfsMountpoint, "containers")
 		if err != nil {
 			oops.Err(err)
+			hadErrors = true
 		} else {
 			if jail != nil {
 				err = oops.Err(jailIpam.Import(jail.IpAddr))
 				if err == nil {
+					log.Printf("imported jails %v", name)
 					state.Jails[name] = jail
+				} else {
+					hadErrors = true
 				}
+			} else {
+				log.Printf("jail is not managed by us %v", name)
 			}
 		}
 	}
 
-	if len(oops.Errors) > 0 {
+	log.Printf("imported jails %v", len(state.Jails))
+
+	if hadErrors {
 		log.Fatalf("found errors import existing jails")
 	}
 
-	state.Volumes, err = zfsListFilesystems("zroot/jails/volumes")
+	state.Volumes, err = zfs.ListFilesystems("volumes")
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	hostImages, err := zfsListFilesystems("zroot/jails/images")
+	hostImages, err := zfs.ListFilesystems("images")
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -1152,6 +1069,15 @@ func main() {
 		<-sig
 		cancel()
 	}()
+
+	reconciler := &Reconciler{
+		State:     state,
+		ImageIpam: imageIpam,
+		JailIpam:  jailIpam,
+		Config:    config,
+		Repo:      repo,
+		Zfs:       zfs,
+	}
 
 	reconciler.Reconcile()
 
