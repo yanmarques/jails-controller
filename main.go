@@ -30,6 +30,8 @@ import (
 const DEFAULT_CONFIG_PATH = "/usr/local/etc/bastille-poller.json"
 const DEFAULT_IMAGE_CIDR = "10.100.0.0/16"
 const DEFAULT_JAIL_CIDR = "10.200.0.0/16"
+const DEFAULT_CMD_TIMEOUT_SMALL = 60
+const DEFAULT_CMD_TIMEOUT_LARGE = 600
 
 var oops *ErrAggregator
 
@@ -80,8 +82,9 @@ type JailParams map[string]string
 type JailAction struct {
 	Type string
 	// Run action
-	Command string
-	Args    []string
+	Command        string
+	CommandTimeout int
+	Args           []string
 	// Copy action
 	Src   string
 	Dest  string
@@ -175,10 +178,27 @@ func (c JailUserParams) JailParams() (JailParams, error) {
 	return params, nil
 }
 
-func runCmd(command string, args ...string) error {
-	stdout, err := exec.Command(command, args...).CombinedOutput()
+func runCmd(timeout int, command string, args ...string) error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, command, args...)
+
+	// this WaitDelay addresses a bug on Go command execution,
+	// maybe on FreeBSD only, when an open file descriptor is not
+	// closed by the callee process (identified here by [`command`]),
+	// causing Go I/O coroutines to wait forever.
+	cmd.WaitDelay = time.Duration(DEFAULT_CMD_TIMEOUT_SMALL) * time.Second
+
+	output, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("command timed out: output=%v: %v %v",
+			strings.TrimSpace(string(output)), command, args)
+	}
+
 	if err != nil {
-		return fmt.Errorf("%v: %v: %v %v", err, strings.TrimSpace(string(stdout)), command, args)
+		return fmt.Errorf("%v: output=%v: %v %v",
+			err, strings.TrimSpace(string(output)), command, args)
 	}
 
 	return nil
@@ -362,9 +382,12 @@ func PrepareJail(jail *Jail, hostPath string, actions []JailAction, mounts []Jai
 	for _, action := range actions {
 		switch action.Type {
 		case "exec":
-			log.Printf("running action %s %v", action.Command, action.Args)
-			err := jail.Exec(action.Command, action.Args...)
-			log.Printf("action ended %s %v", action.Command, action.Args)
+			timeout := action.CommandTimeout
+			if timeout <= 0 {
+				timeout = DEFAULT_CMD_TIMEOUT_SMALL
+			}
+
+			err := jail.Exec(timeout, action.Command, action.Args...)
 			if err != nil {
 				return err
 			}
@@ -700,6 +723,7 @@ func (r *Reconciler) Reconcile() {
 	for _, jail := range jailstoDestroy {
 		oops.Err(r.JailIpam.Free(jail.IpAddr))
 
+		// TODO: track jails already shutdown, otherwise it will be stuck on this call
 		err = oops.Err(jail.Shutdown())
 		if err != nil {
 			continue
@@ -973,7 +997,7 @@ func main() {
 			log.Fatal(err)
 		}
 
-		err = runCmd("/usr/bin/fetch", "https://download.freebsd.org/ftp/releases/amd64/amd64/15.0-RELEASE/base.txz", "-o", basetxz)
+		err = runCmd(DEFAULT_CMD_TIMEOUT_LARGE, "/usr/bin/fetch", "https://download.freebsd.org/ftp/releases/amd64/amd64/15.0-RELEASE/base.txz", "-o", basetxz)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -994,7 +1018,7 @@ func main() {
 			log.Fatal(err)
 		}
 
-		err = runCmd("/usr/bin/tar", "-xf", basetxz, "-C", releasePath, "--unlink")
+		err = runCmd(DEFAULT_CMD_TIMEOUT_SMALL, "/usr/bin/tar", "-xf", basetxz, "-C", releasePath, "--unlink")
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -1004,7 +1028,7 @@ func main() {
 			log.Fatal(err)
 		}
 
-		err = runCmd("/usr/sbin/freebsd-update", "-b", releasePath, "fetch", "install")
+		err = runCmd(DEFAULT_CMD_TIMEOUT_LARGE, "/usr/sbin/freebsd-update", "-b", releasePath, "fetch", "install")
 		if err != nil {
 			log.Fatal(err)
 		}

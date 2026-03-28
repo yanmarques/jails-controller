@@ -27,7 +27,7 @@ func NewZfs(root string) *Zfs {
 func (z *Zfs) Clone(src, dst string, existOk bool) error {
 	srcSet := z.ToDataset(src)
 	dstSet := z.ToDataset(dst)
-	err := runCmd("/sbin/zfs", "list", "-t", "snapshot", srcSet)
+	err := runCmd(DEFAULT_CMD_TIMEOUT_SMALL, "/sbin/zfs", "list", "-t", "snapshot", srcSet)
 	if err != nil {
 		return fmt.Errorf("no such snapshot: %s: %v", srcSet, err)
 	}
@@ -133,7 +133,7 @@ func (z *Zfs) Set(options *ZfsCreateOptions) error {
 
 	args = append(args, z.ToDataset(options.Filesystem))
 
-	return runCmd("/sbin/zfs", args...)
+	return runCmd(DEFAULT_CMD_TIMEOUT_SMALL, "/sbin/zfs", args...)
 }
 
 func (z *Zfs) Create(options *ZfsCreateOptions) error {

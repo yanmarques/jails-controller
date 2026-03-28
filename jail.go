@@ -78,7 +78,7 @@ func ImportEpair(iface string) (*Epair, error) {
 }
 
 func (e *Epair) Delete() error {
-	return runCmd("/sbin/ifconfig", e.Host, "destroy")
+	return runCmd(DEFAULT_CMD_TIMEOUT_SMALL, "/sbin/ifconfig", e.Host, "destroy")
 }
 
 func netstatFirstEtherIface(jail string) (*NetstatIface, error) {
@@ -218,7 +218,7 @@ func JailCreate(manifest *Manifest, zfs *Zfs, zfsMountpoint string, zfsSet strin
 		}
 	}
 
-	err = runCmd("/usr/sbin/jail", paramStr...)
+	err = runCmd(DEFAULT_CMD_TIMEOUT_SMALL, "/usr/sbin/jail", paramStr...)
 	if err != nil {
 		zfs.Destroy(zfsSource, false)
 		epair.Delete()
@@ -259,34 +259,35 @@ func JailCreate(manifest *Manifest, zfs *Zfs, zfsMountpoint string, zfsSet strin
 func (j *Jail) initNetworking() error {
 	// jail side
 	jailCidr := fmt.Sprintf("%s/32", j.IpAddr.String())
-	err := runCmd("/sbin/ifconfig", "-j", j.Name, j.Interface.Jail, jailCidr)
+	err := runCmd(DEFAULT_CMD_TIMEOUT_SMALL, "/sbin/ifconfig", "-j", j.Name, j.Interface.Jail, jailCidr)
 	if err != nil {
 		return err
 	}
 
-	err = runCmd("/sbin/route", "-j", j.Name, "add", "-net", fmt.Sprintf("%s/32", DEFAULT_GATEWAY_IP_ADDR), "-interface", j.Interface.Jail)
+	err = runCmd(DEFAULT_CMD_TIMEOUT_SMALL, "/sbin/route", "-j", j.Name, "add", "-net", fmt.Sprintf("%s/32", DEFAULT_GATEWAY_IP_ADDR), "-interface", j.Interface.Jail)
 	if err != nil {
 		return err
 	}
 
-	err = runCmd("/sbin/route", "-j", j.Name, "add", "default", DEFAULT_GATEWAY_IP_ADDR)
+	err = runCmd(DEFAULT_CMD_TIMEOUT_SMALL, "/sbin/route", "-j", j.Name, "add", "default", DEFAULT_GATEWAY_IP_ADDR)
 	if err != nil {
 		return err
 	}
 
 	// host side
-	err = runCmd("/sbin/ifconfig", j.Interface.Host, "inet", fmt.Sprintf("%s/32", DEFAULT_GATEWAY_IP_ADDR))
+	err = runCmd(DEFAULT_CMD_TIMEOUT_SMALL, "/sbin/ifconfig", j.Interface.Host, "inet", fmt.Sprintf("%s/32", DEFAULT_GATEWAY_IP_ADDR))
 	if err != nil {
 		return err
 	}
 
-	return runCmd("/sbin/route", "add", "-net", jailCidr, "-interface", j.Interface.Host)
+	return runCmd(DEFAULT_CMD_TIMEOUT_SMALL, "/sbin/route", "add", "-net", jailCidr, "-interface", j.Interface.Host)
 }
 
 // TODO: wait until the jails shuts down
 // TODO: handle persistent jails
 func (j *Jail) Shutdown() error {
-	err := runCmd("/usr/sbin/jail", "-r", j.Name)
+	// FIXME: use at least whatever jail params "stop.timeout" is
+	err := runCmd(DEFAULT_CMD_TIMEOUT_LARGE, "/usr/sbin/jail", "-r", j.Name)
 
 	mntPrefix := strings.TrimSuffix(j.Root, "/")
 	mounts, mountsErr := mountinfo.GetMounts(mountinfo.PrefixFilter(mntPrefix))
@@ -299,7 +300,7 @@ func (j *Jail) Shutdown() error {
 			}
 
 			log.Printf("shutdown: umounting %v", mnt.Mountpoint)
-			umountErr := runCmd("/sbin/umount", mnt.Mountpoint)
+			umountErr := runCmd(DEFAULT_CMD_TIMEOUT_SMALL, "/sbin/umount", mnt.Mountpoint)
 			if umountErr != nil {
 				err = fmt.Errorf("%v: %v", err, umountErr)
 			}
@@ -315,19 +316,20 @@ func (j *Jail) Shutdown() error {
 }
 
 func (j *Jail) Destroy() error {
+	log.Printf("destroying jail %s %s", j.Name, j.ZfsDatasource)
 	err := j.Zfs.Destroy(j.ZfsDatasource, true)
 
 	return err
 }
 
-func (j *Jail) Exec(command string, args ...string) error {
+func (j *Jail) Exec(timeout int, command string, args ...string) error {
 	a := []string{j.Name, command}
 	for _, arg := range args {
 		a = append(a, arg)
 	}
 
 	log.Printf("jexec: %v", a)
-	return runCmd("/usr/sbin/jexec", a...)
+	return runCmd(timeout, "/usr/sbin/jexec", a...)
 }
 
 // caller should verify whether [`src`] is "trusted"
@@ -373,7 +375,7 @@ func (j *Jail) Copy(src, dst, owner, group string, modeStr string) error {
 			return err
 		}
 
-		err = j.Exec("chown", fmt.Sprintf("%s:%s", owner, group), dst)
+		err = j.Exec(DEFAULT_CMD_TIMEOUT_SMALL, "chown", fmt.Sprintf("%s:%s", owner, group), dst)
 		if err != nil {
 			return err
 		}
@@ -415,7 +417,7 @@ func (j *Jail) Copy(src, dst, owner, group string, modeStr string) error {
 			return err
 		}
 
-		err = j.Exec("chown", fmt.Sprintf("%s:%s", owner, group), filepath.Join(dst, entry.Name()))
+		err = j.Exec(DEFAULT_CMD_TIMEOUT_SMALL, "chown", fmt.Sprintf("%s:%s", owner, group), filepath.Join(dst, entry.Name()))
 		if err != nil {
 			return err
 		}
@@ -444,17 +446,17 @@ func (j *Jail) Mount(src, dst, owner, group, modeStr string) error {
 		}
 	}
 
-	err = runCmd("/sbin/mount", "-t", "nullfs", "-o", "nosuid,noexec,nodev", src, hostDestPath)
+	err = runCmd(DEFAULT_CMD_TIMEOUT_SMALL, "/sbin/mount", "-t", "nullfs", "-o", "nosuid,noexec,nodev", src, hostDestPath)
 	if err != nil {
 		return err
 	}
 
-	err = j.Exec("chmod", modeStr, dst)
+	err = j.Exec(DEFAULT_CMD_TIMEOUT_SMALL, "chmod", modeStr, dst)
 	if err != nil {
 		return err
 	}
 
-	err = j.Exec("chown", fmt.Sprintf("%s:%s", owner, group), dst)
+	err = j.Exec(DEFAULT_CMD_TIMEOUT_SMALL, "chown", fmt.Sprintf("%s:%s", owner, group), dst)
 	if err != nil {
 		return err
 	}
