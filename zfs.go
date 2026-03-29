@@ -27,12 +27,18 @@ func NewZfs(root string) *Zfs {
 func (z *Zfs) Clone(src, dst string, existOk bool) error {
 	srcSet := z.ToDataset(src)
 	dstSet := z.ToDataset(dst)
-	err := runCmd(DEFAULT_CMD_TIMEOUT_SMALL, "/sbin/zfs", "list", "-t", "snapshot", srcSet)
+	_, _, err := runCmd(&CmdOptions{
+		Path: "/sbin/zfs",
+		Args: []string{"list", "-t", "snapshot", srcSet},
+	})
 	if err != nil {
 		return fmt.Errorf("no such snapshot: %s: %v", srcSet, err)
 	}
 
-	_, stderr, err := runCmdOutput("/sbin/zfs", "clone", srcSet, dstSet)
+	_, stderr, err := runCmd(&CmdOptions{
+		Path: "/sbin/zfs",
+		Args: []string{"clone", srcSet, dstSet},
+	})
 	if err != nil {
 		if bytes.Contains(stderr, []byte("dataset already exists")) {
 			if existOk {
@@ -54,7 +60,10 @@ func (z *Zfs) Clone(src, dst string, existOk bool) error {
 
 func (z *Zfs) CreateSnapshot(dataset, snapName string, existOk bool) error {
 	snapshot := z.ToDataset(dataset + "@" + snapName)
-	_, stderr, err := runCmdOutput("/sbin/zfs", "snapshot", snapshot)
+	_, stderr, err := runCmd(&CmdOptions{
+		Path: "/sbin/zfs",
+		Args: []string{"snapshot", snapshot},
+	})
 	if err != nil {
 		if bytes.Contains(stderr, []byte("dataset already exists")) {
 			if existOk {
@@ -75,7 +84,10 @@ func (z *Zfs) CreateSnapshot(dataset, snapName string, existOk bool) error {
 }
 
 func (z *Zfs) Destroy(filesystem string, notExistsOk bool) error {
-	_, stderr, err := runCmdOutput("/sbin/zfs", "destroy", z.ToDataset(filesystem))
+	_, stderr, err := runCmd(&CmdOptions{
+		Path: "/sbin/zfs",
+		Args: []string{"destroy", z.ToDataset(filesystem)},
+	})
 	if err != nil {
 		if bytes.Contains(stderr, []byte("dataset does not exist")) {
 			if notExistsOk {
@@ -91,8 +103,11 @@ func (z *Zfs) Destroy(filesystem string, notExistsOk bool) error {
 
 func (z *Zfs) ListFilesystems(root string) (map[string]*VolumeManifest, error) {
 	rootSet := z.ToDataset(root)
-	stdout, _, err := runCmdOutput("/sbin/zfs", "list", "-o", "name,quota",
-		"-t", "filesystem", "-H", "-d", "1", "-r", rootSet)
+	stdout, _, err := runCmd(&CmdOptions{
+		Path: "/sbin/zfs",
+		Args: []string{"list", "-o", "name,quota",
+			"-t", "filesystem", "-H", "-d", "1", "-r", rootSet},
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -133,7 +148,12 @@ func (z *Zfs) Set(options *ZfsCreateOptions) error {
 
 	args = append(args, z.ToDataset(options.Filesystem))
 
-	return runCmd(DEFAULT_CMD_TIMEOUT_SMALL, "/sbin/zfs", args...)
+	_, _, err := runCmd(&CmdOptions{
+		Path: "/sbin/zfs",
+		Args: args,
+	})
+
+	return err
 }
 
 func (z *Zfs) Create(options *ZfsCreateOptions) error {
@@ -152,7 +172,10 @@ func (z *Zfs) Create(options *ZfsCreateOptions) error {
 
 	args = append(args, z.ToDataset(options.Filesystem))
 
-	_, stderr, err := runCmdOutput("/sbin/zfs", args...)
+	_, stderr, err := runCmd(&CmdOptions{
+		Path: "/sbin/zfs",
+		Args: args,
+	})
 	if err != nil {
 		if bytes.Contains(stderr, []byte("dataset already exists")) {
 			if options.ExistOk {

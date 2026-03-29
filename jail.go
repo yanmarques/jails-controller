@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bytes"
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -17,6 +17,14 @@ import (
 const SYS_ETHER_IFACE_FLAG = "0x8843"
 const META_MARK = "0xdeadbeef"
 const DEFAULT_GATEWAY_IP_ADDR string = "10.138.1.1"
+const DEFAULT_STOP_TIMEOUT = 60
+
+type IdMap struct {
+	Id   int
+	Name string
+}
+
+type JailParams map[string]string
 
 type Jail struct {
 	Name          string
@@ -26,6 +34,11 @@ type Jail struct {
 	Zfs           *Zfs
 	IpAddr        netip.Addr
 	Mounts        []string
+	ExecUser      IdMap
+	UidMaps       map[string]IdMap
+	GidMaps       map[string]IdMap
+	// only populated for jails created by us, not imported
+	Params JailParams
 }
 
 type Epair struct {
@@ -48,7 +61,10 @@ type NetstatStats struct {
 }
 
 func EpairCreate() (*Epair, error) {
-	stdout, _, err := runCmdOutput("/sbin/ifconfig", "epair", "create")
+	stdout, _, err := runCmd(&CmdOptions{
+		Path: "/sbin/ifconfig",
+		Args: []string{"epair", "create"},
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -78,11 +94,19 @@ func ImportEpair(iface string) (*Epair, error) {
 }
 
 func (e *Epair) Delete() error {
-	return runCmd(DEFAULT_CMD_TIMEOUT_SMALL, "/sbin/ifconfig", e.Host, "destroy")
+	_, _, err := runCmd(&CmdOptions{
+		Path: "/sbin/ifconfig",
+		Args: []string{e.Host, "destroy"},
+	})
+
+	return err
 }
 
 func netstatFirstEtherIface(jail string) (*NetstatIface, error) {
-	stdout, _, err := runCmdOutput("/usr/bin/netstat", "-j", jail, "-i", "-4", "-n", "--libxo", "json")
+	stdout, _, err := runCmd(&CmdOptions{
+		Path: "/usr/bin/netstat",
+		Args: []string{"-j", jail, "-i", "-4", "-n", "--libxo", "json"},
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -106,14 +130,47 @@ func JailImport(name string, zfs *Zfs, zfsMountpoint, zfsSet string) (*Jail, err
 	zfsSource := zfsSet + "/" + name
 	root := filepath.Join(zfsMountpoint, zfsSet, name)
 
-	stdout, _, err := runCmdOutput("/usr/sbin/jls", "-j", name, "meta")
+	stdout, _, err := runCmd(&CmdOptions{
+		Path: "/usr/sbin/jls",
+		Args: []string{"-j", name, "meta"},
+	})
 	if err != nil {
 		return nil, err
 	}
 
-	// not managed by us
-	if !bytes.Equal(bytes.TrimSpace(stdout), []byte(META_MARK)) {
+	metadata := map[string]any{}
+	err = json.Unmarshal(stdout, &metadata)
+	if err != nil {
+		log.Printf("invalid meta in jail %s", name)
 		return nil, nil
+	}
+
+	magic := metadata["magic"]
+	if magic != META_MARK {
+		log.Printf("invalid meta magic in jail %s", name)
+		return nil, nil
+	}
+
+	anyParams := metadata["jailParams"].(map[string]any)
+	params := JailParams{}
+
+	for key, value := range anyParams {
+		strValue, ok := value.(string)
+		if !ok {
+			log.Printf("invalid meta jailParam %s in jail %s", key, name)
+			return nil, nil
+		}
+
+		params[key] = strValue
+	}
+
+	var uids map[string]IdMap
+	var gids map[string]IdMap
+	var uidMap IdMap
+
+	err = parseIdentity(&uidMap, &uids, &gids, name, params, zfsMountpoint, zfsSource)
+	if err != nil {
+		return nil, err
 	}
 
 	iface, err := netstatFirstEtherIface(name)
@@ -163,10 +220,133 @@ func JailImport(name string, zfs *Zfs, zfsMountpoint, zfsSet string) (*Jail, err
 		IpAddr:        ipAddr,
 		Mounts:        mounts,
 		Zfs:           zfs,
+		ExecUser:      uidMap,
+		UidMaps:       uids,
+		GidMaps:       gids,
+		Params:        params,
 	}, nil
 }
 
-func JailCreate(manifest *Manifest, zfs *Zfs, zfsMountpoint string, zfsSet string, ipAddr netip.Addr) (*Jail, error) {
+func ImportUidMap(passwdPath string) (map[string]IdMap, error) {
+	fd, err := os.Open(passwdPath)
+	if err != nil {
+		return nil, err
+	}
+	defer fd.Close()
+
+	scanner := bufio.NewScanner(fd)
+
+	uids := map[string]IdMap{}
+
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		fields := strings.SplitN(line, ":", 7)
+		if len(fields) != 7 {
+			return nil, fmt.Errorf("invalid passwd format at line %d: %s", lineNum, line)
+		}
+
+		uid, err := strconv.Atoi(fields[2])
+		if err != nil {
+			return nil, fmt.Errorf("invalid passwd UID format at line %d: %s: %v", lineNum, line, err)
+		}
+
+		user := fields[0]
+		if user == "" {
+			return nil, fmt.Errorf("user is empty in passwd at line %d: %s", lineNum, line)
+		}
+
+		uids[user] = IdMap{
+			Id:   uid,
+			Name: user,
+		}
+	}
+
+	return uids, nil
+}
+
+func ImportGidMap(groupPath string) (map[string]IdMap, error) {
+	fd, err := os.Open(groupPath)
+	if err != nil {
+		return nil, err
+	}
+	defer fd.Close()
+
+	scanner := bufio.NewScanner(fd)
+
+	gids := map[string]IdMap{}
+
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		fields := strings.SplitN(line, ":", 4)
+		if len(fields) != 4 {
+			return nil, fmt.Errorf("invalid group format at line %d: %s", lineNum, line)
+		}
+
+		gid, err := strconv.Atoi(fields[2])
+		if err != nil {
+			return nil, fmt.Errorf("invalid passwd GID format at line %d: %s: %v", lineNum, line, err)
+		}
+
+		group := fields[0]
+		if group == "" {
+			return nil, fmt.Errorf("group is empty in passwd at line %d: %s", lineNum, line)
+		}
+
+		gids[group] = IdMap{
+			Id:   gid,
+			Name: group,
+		}
+	}
+
+	return gids, nil
+}
+
+func parseIdentity(uidMap *IdMap, uids *map[string]IdMap, gids *map[string]IdMap, name string, params JailParams, zfsMountpoint string, zfsSource string) error {
+	var err error
+	var ok bool
+
+	*uids, err = ImportUidMap(filepath.Join(zfsMountpoint, zfsSource, "etc/passwd"))
+	if err != nil {
+		return err
+	}
+
+	*gids, err = ImportGidMap(filepath.Join(zfsMountpoint, zfsSource, "etc/group"))
+	if err != nil {
+		return err
+	}
+
+	jailUser := params["exec.jail_user"]
+	if jailUser == "" {
+		return fmt.Errorf("exec.jail_user params is required, jail %s", name)
+	}
+
+	*uidMap, ok = (*uids)[jailUser]
+	if !ok {
+		return fmt.Errorf("jail user %s was not found in jail %s /etc/passwd", jailUser, name)
+	}
+
+	if uidMap.Id == 0 {
+		log.Printf("[WARN] running jail as root: %s", name)
+	}
+
+	return nil
+}
+
+func NewJail(manifest *Manifest, zfs *Zfs, zfsMountpoint string, zfsSet string, ipAddr netip.Addr) (*Jail, error) {
 	zfsSource := zfsSet + "/" + manifest.Name
 
 	log.Printf("creating jail %s", zfsSource)
@@ -178,7 +358,19 @@ func JailCreate(manifest *Manifest, zfs *Zfs, zfsMountpoint string, zfsSet strin
 
 	err = zfs.Clone(manifest.Base+"@base", zfsSource, false)
 	if err != nil {
-		return nil, err
+		if os.IsExist(err) {
+			err = zfs.Destroy(zfsSource, false)
+			if err != nil {
+				return nil, err
+			}
+
+			err = zfs.Clone(manifest.Base+"@base", zfsSource, false)
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			return nil, err
+		}
 	}
 
 	epair, err := EpairCreate()
@@ -189,6 +381,17 @@ func JailCreate(manifest *Manifest, zfs *Zfs, zfsMountpoint string, zfsSet strin
 
 	params, err := manifest.Params.JailParams()
 	if err != nil {
+		zfs.Destroy(zfsSource, false)
+		return nil, err
+	}
+
+	var uids map[string]IdMap
+	var gids map[string]IdMap
+	var uidMap IdMap
+
+	err = parseIdentity(&uidMap, &uids, &gids, manifest.Name, params, zfsMountpoint, zfsSource)
+	if err != nil {
+		zfs.Destroy(zfsSource, false)
 		return nil, err
 	}
 
@@ -206,24 +409,20 @@ func JailCreate(manifest *Manifest, zfs *Zfs, zfsMountpoint string, zfsSet strin
 	params["vnet"] = ""
 	params["vnet.interface"] = epair.Jail
 	params["path"] = root
-	params["meta"] = META_MARK
 	params["exec.consolelog"] = fmt.Sprintf("/var/log/bastille/%s_console.log", manifest.Name)
 
-	paramStr := []string{"-c"}
-	for key, value := range params {
-		if len(value) > 0 {
-			paramStr = append(paramStr, fmt.Sprintf("%s=%s", key, value))
-		} else {
-			paramStr = append(paramStr, key)
-		}
+	jailMeta := map[string]any{
+		"magic":      META_MARK,
+		"jailParams": params,
 	}
 
-	err = runCmd(DEFAULT_CMD_TIMEOUT_SMALL, "/usr/sbin/jail", paramStr...)
+	metadata, err := json.Marshal(jailMeta)
 	if err != nil {
-		zfs.Destroy(zfsSource, false)
-		epair.Delete()
-		return nil, err
+		return nil, fmt.Errorf("failed to create jail meta: %v", err)
 	}
+
+	// FIXME: check if meta can hold this, security.jail.meta_maxbufsize
+	params["meta"] = string(metadata)
 
 	mounts := []string{}
 
@@ -231,7 +430,7 @@ func JailCreate(manifest *Manifest, zfs *Zfs, zfsMountpoint string, zfsSet strin
 		mounts = append(mounts, mnt.Volume)
 	}
 
-	jail := Jail{
+	return &Jail{
 		Name:          manifest.Name,
 		Root:          root,
 		ZfsDatasource: zfsSource,
@@ -239,55 +438,134 @@ func JailCreate(manifest *Manifest, zfs *Zfs, zfsMountpoint string, zfsSet strin
 		IpAddr:        ipAddr,
 		Mounts:        mounts,
 		Zfs:           zfs,
+		ExecUser:      uidMap,
+		UidMaps:       uids,
+		GidMaps:       gids,
+		Params:        params,
+	}, nil
+}
+
+func (j *Jail) Start() error {
+	paramStr := []string{"-c"}
+	for key, value := range j.Params {
+		if len(value) > 0 {
+			paramStr = append(paramStr, fmt.Sprintf("%s=%s", key, value))
+		} else {
+			paramStr = append(paramStr, key)
+		}
 	}
 
-	err = jail.initNetworking()
-	if err != nil {
-		defer jail.Destroy()
+	// using CloseFds here because unfortunately if the running
+	// exec.start command holds the fds open, Go will keep trying
+	// to read from it until it's either closed or times out
+	_, _, err := runCmd(&CmdOptions{
+		Path:     "/usr/sbin/jail",
+		Args:     paramStr,
+		CloseFds: true,
+	})
 
-		sErr := jail.Shutdown()
-		if sErr != nil {
-			return nil, fmt.Errorf("%v: %v", err, sErr)
+	if err != nil {
+		shutdownErr := j.Shutdown()
+		destroyErr := j.Destroy()
+
+		if shutdownErr != nil {
+			err = fmt.Errorf("%v: %v", err, shutdownErr)
 		}
 
-		return nil, err
+		if destroyErr != nil {
+			err = fmt.Errorf("%v: %v", err, destroyErr)
+		}
+
+		return err
 	}
 
-	return &jail, nil
+	err = j.initNetworking()
+	if err != nil {
+		defer j.Destroy()
+
+		sErr := j.Shutdown()
+		if sErr != nil {
+			return fmt.Errorf("%v: %v", err, sErr)
+		}
+
+		return err
+	}
+
+	return nil
 }
 
 func (j *Jail) initNetworking() error {
 	// jail side
 	jailCidr := fmt.Sprintf("%s/32", j.IpAddr.String())
-	err := runCmd(DEFAULT_CMD_TIMEOUT_SMALL, "/sbin/ifconfig", "-j", j.Name, j.Interface.Jail, jailCidr)
+	_, _, err := runCmd(&CmdOptions{
+		Path: "/sbin/ifconfig",
+		Args: []string{
+			"-j",
+			j.Name,
+			j.Interface.Jail,
+			jailCidr},
+	})
 	if err != nil {
 		return err
 	}
 
-	err = runCmd(DEFAULT_CMD_TIMEOUT_SMALL, "/sbin/route", "-j", j.Name, "add", "-net", fmt.Sprintf("%s/32", DEFAULT_GATEWAY_IP_ADDR), "-interface", j.Interface.Jail)
+	_, _, err = runCmd(&CmdOptions{
+		Path: "/sbin/route",
+		Args: []string{
+			"-j", j.Name,
+			"add",
+			"-net", fmt.Sprintf("%s/32", DEFAULT_GATEWAY_IP_ADDR),
+			"-interface", j.Interface.Jail},
+	})
 	if err != nil {
 		return err
 	}
 
-	err = runCmd(DEFAULT_CMD_TIMEOUT_SMALL, "/sbin/route", "-j", j.Name, "add", "default", DEFAULT_GATEWAY_IP_ADDR)
+	_, _, err = runCmd(&CmdOptions{
+		Path: "/sbin/route",
+		Args: []string{"-j", j.Name, "add", "default", DEFAULT_GATEWAY_IP_ADDR},
+	})
 	if err != nil {
 		return err
 	}
 
 	// host side
-	err = runCmd(DEFAULT_CMD_TIMEOUT_SMALL, "/sbin/ifconfig", j.Interface.Host, "inet", fmt.Sprintf("%s/32", DEFAULT_GATEWAY_IP_ADDR))
+	_, _, err = runCmd(&CmdOptions{
+		Path: "/sbin/ifconfig",
+		Args: []string{j.Interface.Host, "inet", DEFAULT_GATEWAY_IP_ADDR + "/32"},
+	})
 	if err != nil {
 		return err
 	}
 
-	return runCmd(DEFAULT_CMD_TIMEOUT_SMALL, "/sbin/route", "add", "-net", jailCidr, "-interface", j.Interface.Host)
+	_, _, err = runCmd(&CmdOptions{
+		Path: "/sbin/route",
+		Args: []string{"add", "-net", jailCidr, "-interface", j.Interface.Host},
+	})
+
+	return err
 }
 
-// TODO: wait until the jails shuts down
 // TODO: handle persistent jails
 func (j *Jail) Shutdown() error {
-	// FIXME: use at least whatever jail params "stop.timeout" is
-	err := runCmd(DEFAULT_CMD_TIMEOUT_LARGE, "/usr/sbin/jail", "-r", j.Name)
+	stopTimeout := DEFAULT_STOP_TIMEOUT
+
+	jailStopTimeout := j.Params["stop.timeout"]
+	if jailStopTimeout != "" {
+		timeout, err := strconv.Atoi(jailStopTimeout)
+
+		if err != nil {
+			log.Printf("[WARN] invalid stop.timeout %s, using default %d", jailStopTimeout, stopTimeout)
+		} else {
+			stopTimeout = timeout
+		}
+	}
+
+	_, _, err := runCmd(&CmdOptions{
+		Path:    "/usr/sbin/jail",
+		Args:    []string{"-r", j.Name},
+		Timeout: stopTimeout + 10,
+	})
 
 	mntPrefix := strings.TrimSuffix(j.Root, "/")
 	mounts, mountsErr := mountinfo.GetMounts(mountinfo.PrefixFilter(mntPrefix))
@@ -300,7 +578,10 @@ func (j *Jail) Shutdown() error {
 			}
 
 			log.Printf("shutdown: umounting %v", mnt.Mountpoint)
-			umountErr := runCmd(DEFAULT_CMD_TIMEOUT_SMALL, "/sbin/umount", mnt.Mountpoint)
+			_, _, umountErr := runCmd(&CmdOptions{
+				Path: "/sbin/umount",
+				Args: []string{mnt.Mountpoint},
+			})
 			if umountErr != nil {
 				err = fmt.Errorf("%v: %v", err, umountErr)
 			}
@@ -323,18 +604,33 @@ func (j *Jail) Destroy() error {
 }
 
 func (j *Jail) Exec(timeout int, command string, args ...string) error {
-	a := []string{j.Name, command}
+	a := []string{"-U", j.ExecUser.Name, j.Name, command}
 	for _, arg := range args {
 		a = append(a, arg)
 	}
 
 	log.Printf("jexec: %v", a)
-	return runCmd(timeout, "/usr/sbin/jexec", a...)
+	_, _, err := runCmd(&CmdOptions{
+		Path: "/usr/sbin/jexec",
+		Args: a,
+	})
+
+	return err
 }
 
 // caller should verify whether [`src`] is "trusted"
 // callee does verify whether [`dst`] are within jail bounds
 func (j *Jail) Copy(src, dst, owner, group string, modeStr string) error {
+	uid, ok := j.UidMaps[owner]
+	if !ok {
+		return fmt.Errorf("unknown owner user %s in jail %s", owner, j.Name)
+	}
+
+	gid, ok := j.GidMaps[group]
+	if !ok {
+		return fmt.Errorf("unknown group %s in jail %s", group, j.Name)
+	}
+
 	srcStat, err := os.Stat(src)
 	if err != nil {
 		return err
@@ -375,7 +671,7 @@ func (j *Jail) Copy(src, dst, owner, group string, modeStr string) error {
 			return err
 		}
 
-		err = j.Exec(DEFAULT_CMD_TIMEOUT_SMALL, "chown", fmt.Sprintf("%s:%s", owner, group), dst)
+		err = os.Chown(hostDestPath, uid.Id, gid.Id)
 		if err != nil {
 			return err
 		}
@@ -417,7 +713,7 @@ func (j *Jail) Copy(src, dst, owner, group string, modeStr string) error {
 			return err
 		}
 
-		err = j.Exec(DEFAULT_CMD_TIMEOUT_SMALL, "chown", fmt.Sprintf("%s:%s", owner, group), filepath.Join(dst, entry.Name()))
+		err = os.Chown(destPath, uid.Id, gid.Id)
 		if err != nil {
 			return err
 		}
@@ -434,6 +730,16 @@ func (j *Jail) Mount(src, dst, owner, group, modeStr string) error {
 		return fmt.Errorf("invalid mount dst path: can not mount outside jail root: %s", dst)
 	}
 
+	uid, ok := j.UidMaps[owner]
+	if !ok {
+		return fmt.Errorf("unknown owner user %s in jail %s", owner, j.Name)
+	}
+
+	gid, ok := j.GidMaps[group]
+	if !ok {
+		return fmt.Errorf("unknown group %s in jail %s", group, j.Name)
+	}
+
 	mode, err := strconv.ParseUint(modeStr, 8, 32)
 	if err != nil {
 		return err
@@ -446,17 +752,20 @@ func (j *Jail) Mount(src, dst, owner, group, modeStr string) error {
 		}
 	}
 
-	err = runCmd(DEFAULT_CMD_TIMEOUT_SMALL, "/sbin/mount", "-t", "nullfs", "-o", "nosuid,noexec,nodev", src, hostDestPath)
+	_, _, err = runCmd(&CmdOptions{
+		Path: "/sbin/mount",
+		Args: []string{"-t", "nullfs", "-o", "nosuid,noexec,nodev", src, hostDestPath},
+	})
 	if err != nil {
 		return err
 	}
 
-	err = j.Exec(DEFAULT_CMD_TIMEOUT_SMALL, "chmod", modeStr, dst)
+	err = os.Chmod(hostDestPath, os.FileMode(mode))
 	if err != nil {
 		return err
 	}
 
-	err = j.Exec(DEFAULT_CMD_TIMEOUT_SMALL, "chown", fmt.Sprintf("%s:%s", owner, group), dst)
+	err = os.Chown(hostDestPath, uid.Id, gid.Id)
 	if err != nil {
 		return err
 	}

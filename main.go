@@ -48,6 +48,13 @@ type ErrAggregator struct {
 	Errors []error
 }
 
+type CmdOptions struct {
+	Path     string
+	Args     []string
+	Timeout  int
+	CloseFds bool
+}
+
 type Config struct {
 	// Git repository to fetch
 	RepoUrl string
@@ -77,7 +84,6 @@ type DesiredState struct {
 }
 
 type JailUserParams map[string]any
-type JailParams map[string]string
 
 type JailAction struct {
 	Type string
@@ -178,11 +184,27 @@ func (c JailUserParams) JailParams() (JailParams, error) {
 	return params, nil
 }
 
-func runCmd(timeout int, command string, args ...string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeout)*time.Second)
+func runCmd(options *CmdOptions) ([]byte, []byte, error) {
+	if options.Timeout <= 0 {
+		options.Timeout = DEFAULT_CMD_TIMEOUT_SMALL
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(options.Timeout)*time.Second)
 	defer cancel()
 
-	cmd := exec.CommandContext(ctx, command, args...)
+	var stdout bytes.Buffer
+	var stderr bytes.Buffer
+
+	cmd := exec.CommandContext(ctx, options.Path, options.Args...)
+
+	if options.CloseFds {
+		cmd.Stdin = nil
+		cmd.Stdout = nil
+		cmd.Stderr = nil
+	} else {
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
+	}
 
 	// this WaitDelay addresses a bug on Go command execution,
 	// maybe on FreeBSD only, when an open file descriptor is not
@@ -190,35 +212,31 @@ func runCmd(timeout int, command string, args ...string) error {
 	// causing Go I/O coroutines to wait forever.
 	cmd.WaitDelay = time.Duration(DEFAULT_CMD_TIMEOUT_SMALL) * time.Second
 
-	output, err := cmd.CombinedOutput()
+	err := cmd.Run()
+
+	stdoutB := stdout.Bytes()
+	stderrB := stderr.Bytes()
+
 	if ctx.Err() == context.DeadlineExceeded {
-		return fmt.Errorf("command timed out: output=%v: %v %v",
-			strings.TrimSpace(string(output)), command, args)
+		return stdoutB, stderrB, fmt.Errorf("command timed out: stdout=%s stderr=%s: %v %v",
+			strings.TrimSpace(string(stdoutB)), strings.TrimSpace(string(stderrB)),
+			options.Path, options.Args)
 	}
 
 	if err != nil {
-		return fmt.Errorf("%v: output=%v: %v %v",
-			err, strings.TrimSpace(string(output)), command, args)
+		return stdoutB, stderrB, fmt.Errorf("%v: stdout=%s stderr=%s: %v %v",
+			err, strings.TrimSpace(string(stdoutB)), strings.TrimSpace(string(stderrB)),
+			options.Path, options.Args)
 	}
 
-	return nil
+	return stdoutB, stderrB, nil
 }
 
-func runCmdOutput(command string, args ...string) ([]byte, []byte, error) {
-	var stderr bytes.Buffer
-	cmd := exec.Command(command, args...)
-	cmd.Stderr = &stderr
-
-	stdout, err := cmd.Output()
-	if err != nil {
-		return stdout, stderr.Bytes(), fmt.Errorf("%v: stdout=%v stderr=%v: %v %v",
-			err, strings.TrimSpace(string(stdout)), strings.TrimSpace(stderr.String()), cmd.Path, cmd.Args)
-	}
-
-	return stdout, stderr.Bytes(), nil
-}
 func jailListAll() (map[string]bool, error) {
-	out, _, err := runCmdOutput("/usr/sbin/jls", "name")
+	out, _, err := runCmd(&CmdOptions{
+		Path: "/usr/sbin/jls",
+		Args: []string{"name"},
+	})
 	if err != nil {
 		return nil, err
 	}
@@ -365,8 +383,8 @@ func safePathJoin(base string, untrusted ...string) string {
 	return path
 }
 
-func PrepareJail(jail *Jail, hostPath string, actions []JailAction, mounts []JailMount, config Config) error {
-	// TODO: check for volume existance prior to this
+func PrepareJailBeforeStart(jail *Jail, hostPath string, actions []JailAction, mounts []JailMount, config Config) error {
+	// TODO: check for volume existence prior to this
 	for _, mnt := range mounts {
 		src := safePathJoin(config.ZfsMountpoint, "volumes", mnt.Volume)
 		if len(src) == 0 {
@@ -382,15 +400,7 @@ func PrepareJail(jail *Jail, hostPath string, actions []JailAction, mounts []Jai
 	for _, action := range actions {
 		switch action.Type {
 		case "exec":
-			timeout := action.CommandTimeout
-			if timeout <= 0 {
-				timeout = DEFAULT_CMD_TIMEOUT_SMALL
-			}
-
-			err := jail.Exec(timeout, action.Command, action.Args...)
-			if err != nil {
-				return err
-			}
+			continue
 		case "copy":
 			path := safePathJoin(hostPath, action.Src)
 			if len(path) == 0 {
@@ -401,6 +411,29 @@ func PrepareJail(jail *Jail, hostPath string, actions []JailAction, mounts []Jai
 			if err != nil {
 				return err
 			}
+		default:
+			return fmt.Errorf("unknown action type: %v", action.Type)
+		}
+	}
+
+	return nil
+}
+
+func PrepareJailAfterStart(jail *Jail, hostPath string, actions []JailAction, mounts []JailMount, config Config) error {
+	for _, action := range actions {
+		switch action.Type {
+		case "exec":
+			timeout := action.CommandTimeout
+			if timeout <= 0 {
+				timeout = DEFAULT_CMD_TIMEOUT_SMALL
+			}
+
+			err := jail.Exec(timeout, action.Command, action.Args...)
+			if err != nil {
+				return err
+			}
+		case "copy":
+			continue
 		default:
 			return fmt.Errorf("unknown action type: %v", action.Type)
 		}
@@ -785,17 +818,27 @@ func (r *Reconciler) Reconcile() {
 
 		defer r.ImageIpam.Free(*ipAddr)
 
-		jail, err := JailCreate(manifest, r.Zfs, r.Config.ZfsMountpoint, "images", *ipAddr)
+		jail, err := NewJail(manifest, r.Zfs, r.Config.ZfsMountpoint, "images", *ipAddr)
 		if err != nil {
 			oops.Err(err)
 			break
 		}
 
-		err = oops.Err(PrepareJail(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts, r.Config))
+		err = oops.Err(PrepareJailBeforeStart(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts, r.Config))
+		if err != nil {
+			break
+		}
+
+		err = oops.Err(jail.Start())
+		if err != nil {
+			break
+		}
+
+		err = oops.Err(PrepareJailAfterStart(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts, r.Config))
 
 		oops.Err(jail.Shutdown())
 		if err != nil {
-			jail.Destroy()
+			oops.Err(jail.Destroy())
 		} else {
 			r.State.Images[name] = name
 		}
@@ -852,14 +895,26 @@ func (r *Reconciler) Reconcile() {
 			break
 		}
 
-		jail, err := JailCreate(manifest, r.Zfs, r.Config.ZfsMountpoint, "containers", *ipAddr)
+		jail, err := NewJail(manifest, r.Zfs, r.Config.ZfsMountpoint, "containers", *ipAddr)
 		if err != nil {
 			r.JailIpam.Free(*ipAddr)
 			oops.Err(err)
 			break
 		}
 
-		err = PrepareJail(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts, r.Config)
+		err = oops.Err(PrepareJailBeforeStart(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts, r.Config))
+		if err != nil {
+			r.JailIpam.Free(*ipAddr)
+			break
+		}
+
+		err = oops.Err(jail.Start())
+		if err != nil {
+			r.JailIpam.Free(*ipAddr)
+			break
+		}
+
+		err = oops.Err(PrepareJailAfterStart(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts, r.Config))
 		if err != nil {
 			oops.Err(err)
 
@@ -997,7 +1052,11 @@ func main() {
 			log.Fatal(err)
 		}
 
-		err = runCmd(DEFAULT_CMD_TIMEOUT_LARGE, "/usr/bin/fetch", "https://download.freebsd.org/ftp/releases/amd64/amd64/15.0-RELEASE/base.txz", "-o", basetxz)
+		_, _, err = runCmd(&CmdOptions{
+			Path:    "/usr/bin/fetch",
+			Args:    []string{"https://download.freebsd.org/ftp/releases/amd64/amd64/15.0-RELEASE/base.txz", "-o", basetxz},
+			Timeout: DEFAULT_CMD_TIMEOUT_LARGE,
+		})
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -1018,7 +1077,11 @@ func main() {
 			log.Fatal(err)
 		}
 
-		err = runCmd(DEFAULT_CMD_TIMEOUT_SMALL, "/usr/bin/tar", "-xf", basetxz, "-C", releasePath, "--unlink")
+		_, _, err = runCmd(&CmdOptions{
+			Path:    "/usr/bin/tar",
+			Args:    []string{"-xf", basetxz, "-C", releasePath, "--unlink"},
+			Timeout: DEFAULT_CMD_TIMEOUT_LARGE,
+		})
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -1028,7 +1091,11 @@ func main() {
 			log.Fatal(err)
 		}
 
-		err = runCmd(DEFAULT_CMD_TIMEOUT_LARGE, "/usr/sbin/freebsd-update", "-b", releasePath, "fetch", "install")
+		_, _, err = runCmd(&CmdOptions{
+			Path:    "/usr/sbin/freebsd-update",
+			Args:    []string{"-b", releasePath, "fetch", "install"},
+			Timeout: DEFAULT_CMD_TIMEOUT_LARGE,
+		})
 		if err != nil {
 			log.Fatal(err)
 		}
