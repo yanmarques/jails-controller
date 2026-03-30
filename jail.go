@@ -26,6 +26,13 @@ type IdMap struct {
 
 type JailParams map[string]string
 
+type JailMeta struct {
+	Magic      string
+	JailParams JailParams
+	Events     EventSubscription
+	ServerCert string
+}
+
 type Jail struct {
 	Name          string
 	Root          string
@@ -58,6 +65,12 @@ type NetstatIfaces struct {
 
 type NetstatStats struct {
 	Statistics NetstatIfaces
+}
+
+type JailImportResult struct {
+	Jail   *Jail
+	Events *EventSubscription
+	ApiKey string
 }
 
 func EpairCreate() (*Epair, error) {
@@ -126,7 +139,7 @@ func netstatFirstEtherIface(jail string) (*NetstatIface, error) {
 	return nil, nil
 }
 
-func JailImport(name string, zfs *Zfs, zfsMountpoint, zfsSet string) (*Jail, error) {
+func JailImport(name string, zfs *Zfs, zfsMountpoint, zfsSet string) (*JailImportResult, error) {
 	zfsSource := zfsSet + "/" + name
 	root := filepath.Join(zfsMountpoint, zfsSet, name)
 
@@ -138,37 +151,23 @@ func JailImport(name string, zfs *Zfs, zfsMountpoint, zfsSet string) (*Jail, err
 		return nil, err
 	}
 
-	metadata := map[string]any{}
-	err = json.Unmarshal(stdout, &metadata)
+	var jailMeta JailMeta
+	err = json.Unmarshal(stdout, &jailMeta)
 	if err != nil {
 		log.Printf("invalid meta in jail %s", name)
 		return nil, nil
 	}
 
-	magic := metadata["magic"]
-	if magic != META_MARK {
-		log.Printf("invalid meta magic in jail %s", name)
+	if jailMeta.Magic != META_MARK {
+		log.Printf("invalid meta magic %s in jail %s", jailMeta.Magic, name)
 		return nil, nil
-	}
-
-	anyParams := metadata["jailParams"].(map[string]any)
-	params := JailParams{}
-
-	for key, value := range anyParams {
-		strValue, ok := value.(string)
-		if !ok {
-			log.Printf("invalid meta jailParam %s in jail %s", key, name)
-			return nil, nil
-		}
-
-		params[key] = strValue
 	}
 
 	var uids map[string]IdMap
 	var gids map[string]IdMap
 	var uidMap IdMap
 
-	err = parseIdentity(&uidMap, &uids, &gids, name, params, zfsMountpoint, zfsSource)
+	err = parseIdentity(&uidMap, &uids, &gids, name, jailMeta.JailParams, zfsMountpoint, zfsSource)
 	if err != nil {
 		return nil, err
 	}
@@ -207,12 +206,12 @@ func JailImport(name string, zfs *Zfs, zfsMountpoint, zfsSet string) (*Jail, err
 		}
 
 		if strings.HasPrefix(mnt.Source, volumesPath) && mnt.FSType == "nullfs" {
-			vol := strings.TrimPrefix(mnt.Source, fmt.Sprintf("%s/", volumesPath))
+			vol := strings.TrimPrefix(mnt.Source, volumesPath+"/")
 			mounts = append(mounts, vol)
 		}
 	}
 
-	return &Jail{
+	jail := Jail{
 		Name:          name,
 		Root:          root,
 		ZfsDatasource: zfsSource,
@@ -223,7 +222,12 @@ func JailImport(name string, zfs *Zfs, zfsMountpoint, zfsSet string) (*Jail, err
 		ExecUser:      uidMap,
 		UidMaps:       uids,
 		GidMaps:       gids,
-		Params:        params,
+		Params:        jailMeta.JailParams,
+	}
+
+	return &JailImportResult{
+		Jail:   &jail,
+		Events: &jailMeta.Events,
 	}, nil
 }
 
@@ -346,7 +350,7 @@ func parseIdentity(uidMap *IdMap, uids *map[string]IdMap, gids *map[string]IdMap
 	return nil
 }
 
-func NewJail(manifest *Manifest, zfs *Zfs, zfsMountpoint string, zfsSet string, ipAddr netip.Addr) (*Jail, error) {
+func NewJail(manifest *Manifest, zfs *Zfs, config Config, zfsSet string, ipAddr netip.Addr) (*Jail, error) {
 	zfsSource := zfsSet + "/" + manifest.Name
 
 	log.Printf("creating jail %s", zfsSource)
@@ -389,7 +393,7 @@ func NewJail(manifest *Manifest, zfs *Zfs, zfsMountpoint string, zfsSet string, 
 	var gids map[string]IdMap
 	var uidMap IdMap
 
-	err = parseIdentity(&uidMap, &uids, &gids, manifest.Name, params, zfsMountpoint, zfsSource)
+	err = parseIdentity(&uidMap, &uids, &gids, manifest.Name, params, config.ZfsMountpoint, zfsSource)
 	if err != nil {
 		zfs.Destroy(zfsSource, false)
 		return nil, err
@@ -403,17 +407,18 @@ func NewJail(manifest *Manifest, zfs *Zfs, zfsMountpoint string, zfsSet string, 
 		params["host.hostname"] = manifest.Name
 	}
 
-	root := filepath.Join(zfsMountpoint, zfsSource)
+	root := filepath.Join(config.ZfsMountpoint, zfsSource)
 
 	params["name"] = manifest.Name
 	params["vnet"] = ""
 	params["vnet.interface"] = epair.Jail
 	params["path"] = root
-	params["exec.consolelog"] = fmt.Sprintf("/var/log/bastille/%s_console.log", manifest.Name)
+	params["exec.consolelog"] = filepath.Join(config.LogDir, manifest.Name+"_console.log")
 
-	jailMeta := map[string]any{
-		"magic":      META_MARK,
-		"jailParams": params,
+	jailMeta := JailMeta{
+		Magic:      META_MARK,
+		JailParams: params,
+		Events:     manifest.EventSubscription,
 	}
 
 	metadata, err := json.Marshal(jailMeta)
@@ -449,7 +454,7 @@ func (j *Jail) Start() error {
 	paramStr := []string{"-c"}
 	for key, value := range j.Params {
 		if len(value) > 0 {
-			paramStr = append(paramStr, fmt.Sprintf("%s=%s", key, value))
+			paramStr = append(paramStr, key+"="+value)
 		} else {
 			paramStr = append(paramStr, key)
 		}
@@ -459,9 +464,8 @@ func (j *Jail) Start() error {
 	// exec.start command holds the fds open, Go will keep trying
 	// to read from it until it's either closed or times out
 	_, _, err := runCmd(&CmdOptions{
-		Path:     "/usr/sbin/jail",
-		Args:     paramStr,
-		CloseFds: true,
+		Path: "/usr/sbin/jail",
+		Args: paramStr,
 	})
 
 	if err != nil {
@@ -496,7 +500,7 @@ func (j *Jail) Start() error {
 
 func (j *Jail) initNetworking() error {
 	// jail side
-	jailCidr := fmt.Sprintf("%s/32", j.IpAddr.String())
+	jailCidr := j.IpAddr.String() + "/32"
 	_, _, err := runCmd(&CmdOptions{
 		Path: "/sbin/ifconfig",
 		Args: []string{
@@ -514,7 +518,7 @@ func (j *Jail) initNetworking() error {
 		Args: []string{
 			"-j", j.Name,
 			"add",
-			"-net", fmt.Sprintf("%s/32", DEFAULT_GATEWAY_IP_ADDR),
+			"-net", DEFAULT_GATEWAY_IP_ADDR + "/32",
 			"-interface", j.Interface.Jail},
 	})
 	if err != nil {
@@ -546,6 +550,7 @@ func (j *Jail) initNetworking() error {
 	return err
 }
 
+// TODO: tear down networking, but don't delete interface, move interface deletion to [`Destroy`]
 // TODO: handle persistent jails
 func (j *Jail) Shutdown() error {
 	stopTimeout := DEFAULT_STOP_TIMEOUT

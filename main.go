@@ -3,6 +3,10 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/hex"
+	"encoding/pem"
 	"errors"
 	"flag"
 	"fmt"
@@ -27,9 +31,13 @@ import (
 	"golang.org/x/mod/semver"
 )
 
-const DEFAULT_CONFIG_PATH = "/usr/local/etc/bastille-poller.json"
+const DEFAULT_CONFIG_PATH = "/usr/local/etc/jails-controllers.toml"
 const DEFAULT_IMAGE_CIDR = "10.100.0.0/16"
 const DEFAULT_JAIL_CIDR = "10.200.0.0/16"
+const PUBKEY_PATH_IN_JAIL = "/var/run/jails-controller.pubkey"
+const CONFIG_DIR = "/usr/local/etc/jails-controller"
+const PRIVKEY_PATH = CONFIG_DIR + "/controller.key"
+const PUBKEY_PATH = CONFIG_DIR + "/controller.pubkey"
 const DEFAULT_CMD_TIMEOUT_SMALL = 60
 const DEFAULT_CMD_TIMEOUT_LARGE = 600
 
@@ -42,6 +50,8 @@ type Reconciler struct {
 	JailIpam  *IPManager
 	Config    Config
 	Zfs       *Zfs
+	Notifier  *LazyEventNotifier
+	Keypair   Keypair
 }
 
 type ErrAggregator struct {
@@ -55,6 +65,11 @@ type CmdOptions struct {
 	CloseFds bool
 }
 
+type Keypair struct {
+	Priv ed25519.PrivateKey
+	Pub  ed25519.PublicKey
+}
+
 type Config struct {
 	// Git repository to fetch
 	RepoUrl string
@@ -65,16 +80,22 @@ type Config struct {
 	// How long to wait between fetching attempts
 	PollInterval int
 	// Path to the directory where the repository will be cloned
-	Directory     string
+	Directory string
+
 	ZfsRoot       string
 	ZfsMountpoint string
+
+	LogDir string
+
+	PrivateKeyPath string
 }
 
 type State struct {
-	LastTag string
-	Images  map[string]string
-	Jails   map[string]*Jail
-	Volumes map[string]*VolumeManifest
+	LastTag     string
+	Images      map[string]string
+	Jails       map[string]*Jail
+	Volumes     map[string]*VolumeManifest
+	Subscribers map[string]Subscriber
 }
 
 type DesiredState struct {
@@ -107,14 +128,30 @@ type JailMount struct {
 	Mode   string
 }
 
+type EventSubscription struct {
+	ServerCertPath    string
+	ServerPort        int
+	ServerFingerprint string
+}
+
+func (e EventSubscription) Empty() bool {
+	return e.ServerPort == 0 && e.ServerCertPath == ""
+}
+
+type Subscriber struct {
+	Jail         *Jail
+	Subscription EventSubscription
+}
+
 type Manifest struct {
-	Type     string
-	Disabled bool
-	Name     string
-	Base     string
-	Params   JailUserParams
-	Actions  []JailAction
-	Mounts   []JailMount
+	Type              string
+	Disabled          bool
+	Name              string
+	Base              string
+	Params            JailUserParams
+	EventSubscription EventSubscription
+	Actions           []JailAction
+	Mounts            []JailMount
 
 	// metadata used internally to copy files
 	originalHostPath string
@@ -138,12 +175,24 @@ type IPManager struct {
 	Network netip.Prefix
 }
 
+type EventJailSync struct {
+	Name   string
+	IpAddr string
+}
+
+type EventSyncState struct {
+	Signature    string
+	Verification string
+	Jails        []EventJailSync
+}
+
 func NewState() *State {
 	return &State{
-		Jails:   map[string]*Jail{},
-		Images:  map[string]string{},
-		Volumes: map[string]*VolumeManifest{},
-		LastTag: "",
+		Jails:       map[string]*Jail{},
+		Images:      map[string]string{},
+		Volumes:     map[string]*VolumeManifest{},
+		Subscribers: map[string]Subscriber{},
+		LastTag:     "",
 	}
 }
 
@@ -458,6 +507,31 @@ func (d *DesiredState) addJail(path string, jail *Manifest) error {
 		return nil
 	}
 
+	if jail.EventSubscription.ServerPort <= 0 && !jail.EventSubscription.Empty() {
+		return fmt.Errorf("invalid event port %d in jail manifest %s", jail.EventSubscription.ServerPort, jail.Name)
+	}
+
+	if !jail.EventSubscription.Empty() {
+		serverCertPath := safePathJoin(filepath.Dir(path), jail.EventSubscription.ServerCertPath)
+		if serverCertPath == "" {
+			return fmt.Errorf("invalid server cert path %s: can not copy outside manifest jail: %s",
+				jail.EventSubscription.ServerCertPath, jail.Name)
+		}
+
+		content, err := os.ReadFile(serverCertPath)
+		if err != nil {
+			return err
+		}
+
+		pemDecoded, _ := pem.Decode(content)
+		fingerprint, err := sumFingerprint(pemDecoded.Bytes)
+		if err != nil {
+			return err
+		}
+
+		jail.EventSubscription.ServerFingerprint = hex.EncodeToString(fingerprint[:])
+	}
+
 	_, ok := d.Jails[jail.Name]
 	if ok {
 		return fmt.Errorf("duplicate jail name definitions: %s, aborting", jail.Name)
@@ -765,6 +839,7 @@ func (r *Reconciler) Reconcile() {
 		err = oops.Err(jail.Destroy())
 		if err == nil {
 			delete(r.State.Jails, jail.Name)
+			delete(r.State.Subscribers, jail.Name)
 		}
 	}
 
@@ -818,7 +893,7 @@ func (r *Reconciler) Reconcile() {
 
 		defer r.ImageIpam.Free(*ipAddr)
 
-		jail, err := NewJail(manifest, r.Zfs, r.Config.ZfsMountpoint, "images", *ipAddr)
+		jail, err := NewJail(manifest, r.Zfs, r.Config, "images", *ipAddr)
 		if err != nil {
 			oops.Err(err)
 			break
@@ -895,35 +970,61 @@ func (r *Reconciler) Reconcile() {
 			break
 		}
 
-		jail, err := NewJail(manifest, r.Zfs, r.Config.ZfsMountpoint, "containers", *ipAddr)
+		jail, err := NewJail(manifest, r.Zfs, r.Config, "containers", *ipAddr)
 		if err != nil {
-			r.JailIpam.Free(*ipAddr)
+			oops.Err(jail.Shutdown())
+			oops.Err(jail.Destroy())
+			oops.Err(r.JailIpam.Free(*ipAddr))
 			oops.Err(err)
 			break
 		}
 
 		err = oops.Err(PrepareJailBeforeStart(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts, r.Config))
 		if err != nil {
-			r.JailIpam.Free(*ipAddr)
+			oops.Err(jail.Shutdown())
+			oops.Err(jail.Destroy())
+			oops.Err(r.JailIpam.Free(*ipAddr))
+			oops.Err(err)
 			break
+		}
+
+		if !manifest.EventSubscription.Empty() {
+			err = jail.Copy(PUBKEY_PATH, PUBKEY_PATH_IN_JAIL, "root", "wheel", "644")
+			if err != nil {
+				oops.Err(jail.Shutdown())
+				oops.Err(jail.Destroy())
+				oops.Err(r.JailIpam.Free(*ipAddr))
+				oops.Err(err)
+				break
+			}
 		}
 
 		err = oops.Err(jail.Start())
 		if err != nil {
-			r.JailIpam.Free(*ipAddr)
+			oops.Err(jail.Shutdown())
+			oops.Err(jail.Destroy())
+			oops.Err(r.JailIpam.Free(*ipAddr))
+			oops.Err(err)
 			break
 		}
 
 		err = oops.Err(PrepareJailAfterStart(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts, r.Config))
 		if err != nil {
-			oops.Err(err)
-
 			oops.Err(jail.Shutdown())
 			oops.Err(jail.Destroy())
 			oops.Err(r.JailIpam.Free(*ipAddr))
+			oops.Err(err)
 		} else {
 			// add jail to internal state
 			r.State.Jails[jail.Name] = jail
+
+			if !manifest.EventSubscription.Empty() {
+				sub := Subscriber{
+					Jail:         jail,
+					Subscription: manifest.EventSubscription,
+				}
+				r.State.Subscribers[jail.Name] = sub
+			}
 		}
 	}
 
@@ -931,6 +1032,57 @@ func (r *Reconciler) Reconcile() {
 		if !os.IsNotExist(err) {
 			oops.Err(err)
 		}
+	}
+
+	if len(jailstoCreate)+len(jailstoDestroy) > 0 {
+		msg := make([]byte, 32)
+		rand.Read(msg)
+
+		signature := ed25519.Sign(r.Keypair.Priv, msg)
+
+		jailsSync := EventSyncState{
+			Signature:    hex.EncodeToString(signature),
+			Verification: hex.EncodeToString(msg),
+			Jails:        []EventJailSync{},
+		}
+
+		for _, jail := range r.State.Jails {
+			jailsSync.Jails = append(jailsSync.Jails, EventJailSync{
+				Name:   jail.Name,
+				IpAddr: jail.IpAddr.String(),
+			})
+		}
+
+		for _, subscriber := range r.State.Subscribers {
+			fingerprint, err := hex.DecodeString(subscriber.Subscription.ServerFingerprint)
+			if err != nil {
+				oops.Err(err)
+				continue
+			}
+
+			event := LazyEvent{
+				Server:            subscriber.Jail.Name,
+				ServerFingerprint: fingerprint,
+				Address: ServerAddr{
+					IpAddr: subscriber.Jail.IpAddr,
+					Port:   subscriber.Subscription.ServerPort,
+				},
+				Payload: jailsSync,
+			}
+
+			oops.Err(r.Notifier.Notify(&event))
+		}
+	} else {
+		confirmedOnes := map[string]ServerAddr{}
+
+		for _, sub := range r.State.Subscribers {
+			confirmedOnes[sub.Jail.Name] = ServerAddr{
+				IpAddr: sub.Jail.IpAddr,
+				Port:   sub.Subscription.ServerPort,
+			}
+		}
+
+		r.Notifier.RetryFailures(confirmedOnes)
 	}
 
 	r.State.LastTag = currentGitTag.Hash.String()
@@ -946,13 +1098,13 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Ldate | log.Lshortfile)
 	log.Printf("config path: %s\n", *configPath)
 
-	content, err := os.ReadFile(*configPath)
+	privkeyContent, err := os.ReadFile(*configPath)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	var config Config
-	err = toml.Unmarshal(content, &config)
+	err = toml.Unmarshal(privkeyContent, &config)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -968,6 +1120,54 @@ func main() {
 	}
 
 	config.Directory = absPath
+
+	err = os.Mkdir(CONFIG_DIR, os.FileMode(0700))
+	if err != nil && !os.IsExist(err) {
+		log.Fatal(err)
+	}
+
+	var privKey ed25519.PrivateKey
+	var pubKey ed25519.PublicKey
+
+	privkeyContent, privkeyErr := os.ReadFile(PRIVKEY_PATH)
+	pubkeyContent, pubkeyErr := os.ReadFile(PUBKEY_PATH)
+	if privkeyErr != nil {
+		if os.IsNotExist(privkeyErr) {
+			pubKey, privKey, err = ed25519.GenerateKey(rand.Reader)
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			err = os.WriteFile(PRIVKEY_PATH, privKey, os.FileMode(0700))
+			if err != nil {
+				log.Fatal(err)
+			}
+
+			err = os.WriteFile(PUBKEY_PATH, pubKey, os.FileMode(0755))
+			if err != nil {
+				os.Remove(PRIVKEY_PATH)
+				log.Fatal(err)
+			}
+
+		} else {
+			log.Fatal(privkeyErr)
+		}
+	} else {
+		if pubkeyErr != nil {
+			log.Fatal(pubkeyErr)
+		}
+
+		if len(privkeyContent) != ed25519.PrivateKeySize {
+			log.Fatal(fmt.Errorf("invalid ed25519 private key at %s", PRIVKEY_PATH))
+		}
+
+		if len(pubkeyContent) != ed25519.PublicKeySize {
+			log.Fatal(fmt.Errorf("invalid ed25519 public key %s", PUBKEY_PATH))
+		}
+
+		privKey = privkeyContent
+		pubKey = pubkeyContent
+	}
 
 	imageIpam, err := NewIPManager(DEFAULT_IMAGE_CIDR)
 	if err != nil {
@@ -1113,16 +1313,23 @@ func main() {
 
 	hadErrors := false
 	for name := range existingJails {
-		jail, err := JailImport(name, zfs, config.ZfsMountpoint, "containers")
+		result, err := JailImport(name, zfs, config.ZfsMountpoint, "containers")
 		if err != nil {
 			oops.Err(err)
 			hadErrors = true
 		} else {
-			if jail != nil {
-				err = oops.Err(jailIpam.Import(jail.IpAddr))
+			if result != nil {
+				err = oops.Err(jailIpam.Import(result.Jail.IpAddr))
 				if err == nil {
 					log.Printf("imported jails %v", name)
-					state.Jails[name] = jail
+					state.Jails[name] = result.Jail
+
+					if !result.Events.Empty() {
+						state.Subscribers[name] = Subscriber{
+							Jail:         result.Jail,
+							Subscription: *result.Events,
+						}
+					}
 				} else {
 					hadErrors = true
 				}
@@ -1168,6 +1375,11 @@ func main() {
 		Config:    config,
 		Repo:      repo,
 		Zfs:       zfs,
+		Notifier:  NewEventNotifier(5, 15*time.Second),
+		Keypair: Keypair{
+			Priv: privKey,
+			Pub:  pubKey,
+		},
 	}
 
 	reconciler.Reconcile()
