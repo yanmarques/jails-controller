@@ -3,37 +3,24 @@ package main
 import (
 	"crypto/ed25519"
 	"crypto/tls"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"os"
 	"time"
+
+	core "github.com/yanmarques/jails-controller/pkg/core"
 )
 
-const PUBKEY_PATH_IN_JAIL = "/var/run/jails-controller.pubkey"
-
-type EventJailSync struct {
-	Name   string
-	IpAddr string
-}
-
-type EventSyncState struct {
-	Signature    string
-	Verification string
-	Jails        []EventJailSync
-}
-
 func main() {
-	pubKey, err := os.ReadFile(PUBKEY_PATH_IN_JAIL)
+	pubKey, err := os.ReadFile(core.PUBKEY_PATH_IN_JAIL)
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	if len(pubKey) != ed25519.PublicKeySize {
-		log.Fatal(fmt.Errorf("invalid ed25519 public key %s", PUBKEY_PATH_IN_JAIL))
+		log.Fatal(fmt.Errorf("invalid ed25519 public key %s", core.PUBKEY_PATH_IN_JAIL))
 	}
 
 	jailsCtlPubkey := ed25519.PublicKey(pubKey)
@@ -53,31 +40,9 @@ func main() {
 			return
 		}
 
-		var event EventSyncState
-
-		err = json.Unmarshal(body, &event)
+		event, err := core.ParseEventSync(body, jailsCtlPubkey)
 		if err != nil {
-			log.Printf("parsing json body: %v", err)
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-
-		msg, err := hex.DecodeString(event.Verification)
-		if err != nil {
-			log.Printf("parsing verification message: %v", err)
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-
-		sig, err := hex.DecodeString(event.Signature)
-		if err != nil {
-			log.Printf("parsing signature: %v", err)
-			w.WriteHeader(http.StatusBadRequest)
-			return
-		}
-
-		if !ed25519.Verify(jailsCtlPubkey, msg, sig) {
-			log.Printf("wrong signature, spook detected at address %s", r.RemoteAddr)
+			log.Printf("parsing event: %v", err)
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}

@@ -1,4 +1,4 @@
-module github.com/yanmarques/bastille-poller
+module github.com/yanmarques/jails-controller
 
 go 1.25.5
 

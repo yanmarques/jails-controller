@@ -1,4 +1,4 @@
-package main
+package controller
 
 import (
 	"bytes"
@@ -6,21 +6,19 @@ import (
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
-	"flag"
 	"fmt"
 	"io"
 	"log"
 	"net/netip"
 	"os"
 	"os/exec"
-	"os/signal"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	git "github.com/go-git/go-git/v6"
@@ -1088,17 +1086,35 @@ func (r *Reconciler) Reconcile() {
 	r.State.LastTag = currentGitTag.Hash.String()
 }
 
-func main() {
-	configPath := flag.String("config", DEFAULT_CONFIG_PATH, "Path to configuration")
+func ParseEventSync(body []byte, pubKey ed25519.PublicKey) (*EventSyncState, error) {
+	var event EventSyncState
 
-	flag.Parse()
+	err := json.Unmarshal(body, &event)
+	if err != nil {
+		return nil, fmt.Errorf("parsing json body: %v", err)
+	}
 
+	msg, err := hex.DecodeString(event.Verification)
+	if err != nil {
+		return nil, fmt.Errorf("parsing verification message: %v", err)
+	}
+
+	sig, err := hex.DecodeString(event.Signature)
+	if err != nil {
+		return nil, fmt.Errorf("parsing signature: %v", err)
+	}
+
+	if !ed25519.Verify(pubKey, msg, sig) {
+		return nil, fmt.Errorf("wrong signature: %s", sig)
+	}
+
+	return &event, nil
+}
+
+func NewReconcilerOrFail(configPath string) *Reconciler {
 	oops = NewErrAggregator()
 
-	log.SetFlags(log.LstdFlags | log.Ldate | log.Lshortfile)
-	log.Printf("config path: %s\n", *configPath)
-
-	privkeyContent, err := os.ReadFile(*configPath)
+	privkeyContent, err := os.ReadFile(configPath)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -1108,11 +1124,6 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-
-	log.Printf("config.repoUrl: %v\n", config.RepoUrl)
-	log.Printf("config.repoPath: %v\n", config.RepoPath)
-	log.Printf("config.pollInterval: %v\n", config.PollInterval)
-	log.Printf("config.directory: %v\n", config.Directory)
 
 	absPath, err := filepath.Abs(config.Directory)
 	if err != nil {
@@ -1359,15 +1370,6 @@ func main() {
 		state.Images[vol.Name] = vol.Name
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-
-	go func() {
-		sig := make(chan os.Signal, 1)
-		signal.Notify(sig, syscall.SIGTERM, syscall.SIGINT)
-		<-sig
-		cancel()
-	}()
-
 	reconciler := &Reconciler{
 		State:     state,
 		ImageIpam: imageIpam,
@@ -1382,16 +1384,5 @@ func main() {
 		},
 	}
 
-	reconciler.Reconcile()
-
-	for {
-		timer := time.After(time.Duration(config.PollInterval) * time.Second)
-		select {
-		case <-ctx.Done():
-			return
-		case <-timer:
-			reconciler.Reconcile()
-		}
-
-	}
+	return reconciler
 }
