@@ -126,6 +126,8 @@ func (n *LazyEventNotifier) RetryFailures(confirmedServers map[string]ServerAddr
 					server, attempts)
 				delete(n.Queue, server)
 			}
+		} else {
+			delete(n.Queue, server)
 		}
 	}
 }
@@ -165,10 +167,7 @@ func (n *LazyEventNotifier) sendNotification(event *LazyEvent, attempts int) err
 
 	defer resp.Body.Close()
 
-	var respBody []byte
-	_, err = resp.Body.Read(respBody)
-
-	if err != nil || resp.StatusCode != http.StatusNoContent {
+	if resp.StatusCode != http.StatusNoContent {
 		n.Queue[event.Server] = LazyPackage{
 			Event:            event,
 			DeliveryAttempts: attempts,

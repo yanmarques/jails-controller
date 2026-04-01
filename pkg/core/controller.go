@@ -32,7 +32,7 @@ import (
 const DEFAULT_CONFIG_PATH = "/usr/local/etc/jails-controllers.toml"
 const DEFAULT_IMAGE_CIDR = "10.100.0.0/16"
 const DEFAULT_JAIL_CIDR = "10.200.0.0/16"
-const PUBKEY_PATH_IN_JAIL = "/var/run/jails-controller.pubkey"
+const PUBKEY_PATH_IN_JAIL = "/usr/local/etc/jails-controller.pubkey"
 const CONFIG_DIR = "/usr/local/etc/jails-controller"
 const PRIVKEY_PATH = CONFIG_DIR + "/controller.key"
 const PUBKEY_PATH = CONFIG_DIR + "/controller.pubkey"
@@ -61,6 +61,7 @@ type CmdOptions struct {
 	Args     []string
 	Timeout  int
 	CloseFds bool
+	Stdin    io.Reader
 }
 
 type Keypair struct {
@@ -105,7 +106,8 @@ type DesiredState struct {
 type JailUserParams map[string]any
 
 type JailAction struct {
-	Type string
+	Type        string
+	BeforeStart bool
 	// Run action
 	Command        string
 	CommandTimeout int
@@ -119,11 +121,12 @@ type JailAction struct {
 }
 
 type JailMount struct {
-	Volume string
-	Dest   string
-	Owner  string
-	Group  string
-	Mode   string
+	Volume    string
+	Dest      string
+	Owner     string
+	Group     string
+	Mode      string
+	ReadWrite bool
 }
 
 type EventSubscription struct {
@@ -169,8 +172,9 @@ type IPSlot struct {
 }
 
 type IPManager struct {
-	Slots   []IPSlot
-	Network netip.Prefix
+	Slots    []IPSlot
+	Network  netip.Prefix
+	LastSlot int
 }
 
 type EventJailSync struct {
@@ -231,7 +235,7 @@ func (c JailUserParams) JailParams() (JailParams, error) {
 	return params, nil
 }
 
-func runCmd(options *CmdOptions) ([]byte, []byte, error) {
+func RunCmd(options *CmdOptions) ([]byte, []byte, error) {
 	if options.Timeout <= 0 {
 		options.Timeout = DEFAULT_CMD_TIMEOUT_SMALL
 	}
@@ -251,6 +255,7 @@ func runCmd(options *CmdOptions) ([]byte, []byte, error) {
 	} else {
 		cmd.Stdout = &stdout
 		cmd.Stderr = &stderr
+		cmd.Stdin = options.Stdin
 	}
 
 	// this WaitDelay addresses a bug on Go command execution,
@@ -280,7 +285,7 @@ func runCmd(options *CmdOptions) ([]byte, []byte, error) {
 }
 
 func jailListAll() (map[string]bool, error) {
-	out, _, err := runCmd(&CmdOptions{
+	out, _, err := RunCmd(&CmdOptions{
 		Path: "/usr/sbin/jls",
 		Args: []string{"name"},
 	})
@@ -329,8 +334,9 @@ func NewIPManager(prefix string) (*IPManager, error) {
 	}
 
 	return &IPManager{
-		Slots:   []IPSlot{},
-		Network: network,
+		Slots:    []IPSlot{},
+		Network:  network,
+		LastSlot: 0,
 	}, nil
 }
 
@@ -345,8 +351,9 @@ func (i *IPManager) AllocateIP() (*netip.Addr, error) {
 	var addr netip.Addr
 	if len(i.Slots) == 0 {
 		addr = i.Network.Addr().Next()
+		i.LastSlot = 0
 	} else {
-		lastInSlot := i.Slots[len(i.Slots)-1]
+		lastInSlot := i.Slots[i.LastSlot]
 		addr = lastInSlot.IP.Next()
 	}
 
@@ -354,6 +361,7 @@ func (i *IPManager) AllocateIP() (*netip.Addr, error) {
 		return nil, fmt.Errorf("ipmanager: no more IPs available")
 	}
 
+	i.LastSlot = len(i.Slots)
 	i.Slots = append(i.Slots, IPSlot{
 		IP:    addr,
 		InUse: true,
@@ -382,6 +390,13 @@ func (i *IPManager) Import(ipAddr netip.Addr) error {
 		if slot.IP == ipAddr {
 			i.Slots[idx].InUse = true
 			return nil
+		}
+	}
+
+	if len(i.Slots) > 0 {
+		lastInSlot := i.Slots[i.LastSlot]
+		if ipAddr.Compare(lastInSlot.IP) > 0 {
+			i.LastSlot = len(i.Slots)
 		}
 	}
 
@@ -438,7 +453,7 @@ func PrepareJailBeforeStart(jail *Jail, hostPath string, actions []JailAction, m
 			return fmt.Errorf("invalid mount src path: can not mount outside jail path: %s", mnt.Volume)
 		}
 
-		err := jail.Mount(src, mnt.Dest, mnt.Owner, mnt.Group, mnt.Mode)
+		err := jail.Mount(src, mnt.Dest, mnt.Owner, mnt.Group, mnt.Mode, mnt.ReadWrite, true)
 		if err != nil {
 			return err
 		}
@@ -449,6 +464,10 @@ func PrepareJailBeforeStart(jail *Jail, hostPath string, actions []JailAction, m
 		case "exec":
 			continue
 		case "copy":
+			if !action.BeforeStart {
+				continue
+			}
+
 			path := safePathJoin(hostPath, action.Src)
 			if len(path) == 0 {
 				return fmt.Errorf("invalid copy src path: can not copy outside manifest path: %s", action.Src)
@@ -480,7 +499,19 @@ func PrepareJailAfterStart(jail *Jail, hostPath string, actions []JailAction, mo
 				return err
 			}
 		case "copy":
-			continue
+			if action.BeforeStart {
+				continue
+			}
+
+			path := safePathJoin(hostPath, action.Src)
+			if len(path) == 0 {
+				return fmt.Errorf("invalid copy src path: can not copy outside manifest path: %s", action.Src)
+			}
+
+			err := jail.Copy(path, action.Dest, action.Owner, action.Group, action.Mode)
+			if err != nil {
+				return err
+			}
 		default:
 			return fmt.Errorf("unknown action type: %v", action.Type)
 		}
@@ -530,6 +561,15 @@ func (d *DesiredState) addJail(path string, jail *Manifest) error {
 		jail.EventSubscription.ServerFingerprint = hex.EncodeToString(fingerprint[:])
 	}
 
+	for idx, action := range jail.Actions {
+		if action.BeforeStart {
+			continue
+		}
+
+		// jail actions after start are useless
+		jail.Actions[idx].BeforeStart = true
+	}
+
 	_, ok := d.Jails[jail.Name]
 	if ok {
 		return fmt.Errorf("duplicate jail name definitions: %s, aborting", jail.Name)
@@ -558,7 +598,7 @@ func (d *DesiredState) addImage(path string, image *Manifest) error {
 		image.Mounts = []JailMount{}
 	}
 
-	image.originalHostPath = path
+	image.originalHostPath = filepath.Dir(path)
 	d.Images[image.Name] = image
 
 	return nil
@@ -889,21 +929,26 @@ func (r *Reconciler) Reconcile() {
 			break
 		}
 
-		defer r.ImageIpam.Free(*ipAddr)
-
 		jail, err := NewJail(manifest, r.Zfs, r.Config, "images", *ipAddr)
 		if err != nil {
 			oops.Err(err)
+			oops.Err(r.ImageIpam.Free(*ipAddr))
 			break
 		}
 
 		err = oops.Err(PrepareJailBeforeStart(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts, r.Config))
 		if err != nil {
+			oops.Err(jail.Shutdown())
+			oops.Err(jail.Destroy())
+			oops.Err(r.ImageIpam.Free(*ipAddr))
 			break
 		}
 
 		err = oops.Err(jail.Start())
 		if err != nil {
+			oops.Err(jail.Shutdown())
+			oops.Err(jail.Destroy())
+			oops.Err(r.ImageIpam.Free(*ipAddr))
 			break
 		}
 
@@ -970,48 +1015,46 @@ func (r *Reconciler) Reconcile() {
 
 		jail, err := NewJail(manifest, r.Zfs, r.Config, "containers", *ipAddr)
 		if err != nil {
-			oops.Err(jail.Shutdown())
-			oops.Err(jail.Destroy())
-			oops.Err(r.JailIpam.Free(*ipAddr))
 			oops.Err(err)
+			oops.Err(r.JailIpam.Free(*ipAddr))
 			break
 		}
 
 		err = oops.Err(PrepareJailBeforeStart(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts, r.Config))
 		if err != nil {
+			oops.Err(err)
 			oops.Err(jail.Shutdown())
 			oops.Err(jail.Destroy())
 			oops.Err(r.JailIpam.Free(*ipAddr))
-			oops.Err(err)
 			break
 		}
 
 		if !manifest.EventSubscription.Empty() {
 			err = jail.Copy(PUBKEY_PATH, PUBKEY_PATH_IN_JAIL, "root", "wheel", "644")
 			if err != nil {
+				oops.Err(err)
 				oops.Err(jail.Shutdown())
 				oops.Err(jail.Destroy())
 				oops.Err(r.JailIpam.Free(*ipAddr))
-				oops.Err(err)
 				break
 			}
 		}
 
 		err = oops.Err(jail.Start())
 		if err != nil {
+			oops.Err(err)
 			oops.Err(jail.Shutdown())
 			oops.Err(jail.Destroy())
 			oops.Err(r.JailIpam.Free(*ipAddr))
-			oops.Err(err)
 			break
 		}
 
 		err = oops.Err(PrepareJailAfterStart(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts, r.Config))
 		if err != nil {
+			oops.Err(err)
 			oops.Err(jail.Shutdown())
 			oops.Err(jail.Destroy())
 			oops.Err(r.JailIpam.Free(*ipAddr))
-			oops.Err(err)
 		} else {
 			// add jail to internal state
 			r.State.Jails[jail.Name] = jail
@@ -1111,8 +1154,14 @@ func ParseEventSync(body []byte, pubKey ed25519.PublicKey) (*EventSyncState, err
 	return &event, nil
 }
 
-func NewReconcilerOrFail(configPath string) *Reconciler {
+// TODO: i dislike this but now it's too late?
+func InitLogging() {
+	log.SetFlags(log.LstdFlags | log.Ldate | log.Lshortfile)
 	oops = NewErrAggregator()
+}
+
+func NewReconcilerOrFail(configPath string) *Reconciler {
+	InitLogging()
 
 	privkeyContent, err := os.ReadFile(configPath)
 	if err != nil {
@@ -1263,7 +1312,7 @@ func NewReconcilerOrFail(configPath string) *Reconciler {
 			log.Fatal(err)
 		}
 
-		_, _, err = runCmd(&CmdOptions{
+		_, _, err = RunCmd(&CmdOptions{
 			Path:    "/usr/bin/fetch",
 			Args:    []string{"https://download.freebsd.org/ftp/releases/amd64/amd64/15.0-RELEASE/base.txz", "-o", basetxz},
 			Timeout: DEFAULT_CMD_TIMEOUT_LARGE,
@@ -1288,7 +1337,7 @@ func NewReconcilerOrFail(configPath string) *Reconciler {
 			log.Fatal(err)
 		}
 
-		_, _, err = runCmd(&CmdOptions{
+		_, _, err = RunCmd(&CmdOptions{
 			Path:    "/usr/bin/tar",
 			Args:    []string{"-xf", basetxz, "-C", releasePath, "--unlink"},
 			Timeout: DEFAULT_CMD_TIMEOUT_LARGE,
@@ -1302,7 +1351,7 @@ func NewReconcilerOrFail(configPath string) *Reconciler {
 			log.Fatal(err)
 		}
 
-		_, _, err = runCmd(&CmdOptions{
+		_, _, err = RunCmd(&CmdOptions{
 			Path:    "/usr/sbin/freebsd-update",
 			Args:    []string{"-b", releasePath, "fetch", "install"},
 			Timeout: DEFAULT_CMD_TIMEOUT_LARGE,

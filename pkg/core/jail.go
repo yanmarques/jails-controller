@@ -74,7 +74,7 @@ type JailImportResult struct {
 }
 
 func EpairCreate() (*Epair, error) {
-	stdout, _, err := runCmd(&CmdOptions{
+	stdout, _, err := RunCmd(&CmdOptions{
 		Path: "/sbin/ifconfig",
 		Args: []string{"epair", "create"},
 	})
@@ -107,7 +107,7 @@ func ImportEpair(iface string) (*Epair, error) {
 }
 
 func (e *Epair) Delete() error {
-	_, _, err := runCmd(&CmdOptions{
+	_, _, err := RunCmd(&CmdOptions{
 		Path: "/sbin/ifconfig",
 		Args: []string{e.Host, "destroy"},
 	})
@@ -116,7 +116,7 @@ func (e *Epair) Delete() error {
 }
 
 func netstatFirstEtherIface(jail string) (*NetstatIface, error) {
-	stdout, _, err := runCmd(&CmdOptions{
+	stdout, _, err := RunCmd(&CmdOptions{
 		Path: "/usr/bin/netstat",
 		Args: []string{"-j", jail, "-i", "-4", "-n", "--libxo", "json"},
 	})
@@ -143,7 +143,7 @@ func JailImport(name string, zfs *Zfs, zfsMountpoint, zfsSet string) (*JailImpor
 	zfsSource := zfsSet + "/" + name
 	root := filepath.Join(zfsMountpoint, zfsSet, name)
 
-	stdout, _, err := runCmd(&CmdOptions{
+	stdout, _, err := RunCmd(&CmdOptions{
 		Path: "/usr/sbin/jls",
 		Args: []string{"-j", name, "meta"},
 	})
@@ -463,7 +463,7 @@ func (j *Jail) Start() error {
 	// using CloseFds here because unfortunately if the running
 	// exec.start command holds the fds open, Go will keep trying
 	// to read from it until it's either closed or times out
-	_, _, err := runCmd(&CmdOptions{
+	_, _, err := RunCmd(&CmdOptions{
 		Path: "/usr/sbin/jail",
 		Args: paramStr,
 	})
@@ -501,7 +501,7 @@ func (j *Jail) Start() error {
 func (j *Jail) initNetworking() error {
 	// jail side
 	jailCidr := j.IpAddr.String() + "/32"
-	_, _, err := runCmd(&CmdOptions{
+	_, _, err := RunCmd(&CmdOptions{
 		Path: "/sbin/ifconfig",
 		Args: []string{
 			"-j",
@@ -513,7 +513,7 @@ func (j *Jail) initNetworking() error {
 		return err
 	}
 
-	_, _, err = runCmd(&CmdOptions{
+	_, _, err = RunCmd(&CmdOptions{
 		Path: "/sbin/route",
 		Args: []string{
 			"-j", j.Name,
@@ -525,7 +525,7 @@ func (j *Jail) initNetworking() error {
 		return err
 	}
 
-	_, _, err = runCmd(&CmdOptions{
+	_, _, err = RunCmd(&CmdOptions{
 		Path: "/sbin/route",
 		Args: []string{"-j", j.Name, "add", "default", DEFAULT_GATEWAY_IP_ADDR},
 	})
@@ -534,7 +534,7 @@ func (j *Jail) initNetworking() error {
 	}
 
 	// host side
-	_, _, err = runCmd(&CmdOptions{
+	_, _, err = RunCmd(&CmdOptions{
 		Path: "/sbin/ifconfig",
 		Args: []string{j.Interface.Host, "inet", DEFAULT_GATEWAY_IP_ADDR + "/32"},
 	})
@@ -542,7 +542,7 @@ func (j *Jail) initNetworking() error {
 		return err
 	}
 
-	_, _, err = runCmd(&CmdOptions{
+	_, _, err = RunCmd(&CmdOptions{
 		Path: "/sbin/route",
 		Args: []string{"add", "-net", jailCidr, "-interface", j.Interface.Host},
 	})
@@ -566,7 +566,7 @@ func (j *Jail) Shutdown() error {
 		}
 	}
 
-	_, _, err := runCmd(&CmdOptions{
+	_, _, err := RunCmd(&CmdOptions{
 		Path:    "/usr/sbin/jail",
 		Args:    []string{"-r", j.Name},
 		Timeout: stopTimeout + 10,
@@ -583,7 +583,7 @@ func (j *Jail) Shutdown() error {
 			}
 
 			log.Printf("shutdown: umounting %v", mnt.Mountpoint)
-			_, _, umountErr := runCmd(&CmdOptions{
+			_, _, umountErr := RunCmd(&CmdOptions{
 				Path: "/sbin/umount",
 				Args: []string{mnt.Mountpoint},
 			})
@@ -615,7 +615,7 @@ func (j *Jail) Exec(timeout int, command string, args ...string) error {
 	}
 
 	log.Printf("jexec: %v", a)
-	_, _, err := runCmd(&CmdOptions{
+	_, _, err := RunCmd(&CmdOptions{
 		Path: "/usr/sbin/jexec",
 		Args: a,
 	})
@@ -641,15 +641,21 @@ func (j *Jail) Copy(src, dst, owner, group string, modeStr string) error {
 		return err
 	}
 
+	if !srcStat.Mode().IsRegular() {
+		return fmt.Errorf("will not copy links: %v", src)
+	}
+
+	log.Printf("jail copy src %s dst %s", src, dst)
+
 	hostDestPath := safePathJoin(j.Root, dst)
 	if len(hostDestPath) == 0 {
 		return fmt.Errorf("invalid copy dst path: can not copy outside jail root: %s", dst)
 	}
 
-	dstStat, err := os.Stat(hostDestPath)
-	if err != nil {
-		if !os.IsNotExist(err) {
-			return err
+	dstStat, dstStatErr := os.Stat(hostDestPath)
+	if dstStatErr != nil {
+		if !os.IsNotExist(dstStatErr) {
+			return dstStatErr
 		}
 	}
 
@@ -659,8 +665,19 @@ func (j *Jail) Copy(src, dst, owner, group string, modeStr string) error {
 	}
 
 	if !srcStat.IsDir() {
-		if !srcStat.Mode().Type().IsRegular() {
-			return fmt.Errorf("can not copy links: %v", src)
+		if dstStatErr != nil && os.IsNotExist(dstStatErr) {
+			parentDir := filepath.Dir(hostDestPath)
+			if !strings.HasPrefix(parentDir, j.Root) {
+				return fmt.Errorf("copy dest does not exist in jail: %s", dst)
+			}
+
+			_, err := os.Stat(parentDir)
+			if err != nil {
+				if os.IsNotExist(err) {
+					return fmt.Errorf("copy dest does not exist in jail: %s", dst)
+				}
+				return err
+			}
 		}
 
 		if dstStat != nil && dstStat.IsDir() {
@@ -729,12 +746,7 @@ func (j *Jail) Copy(src, dst, owner, group string, modeStr string) error {
 
 // caller should verify whether [`src`] is "trusted"
 // callee does verify whether [`dst`] are within jail bounds
-func (j *Jail) Mount(src, dst, owner, group, modeStr string) error {
-	hostDestPath := safePathJoin(j.Root, dst)
-	if len(hostDestPath) == 0 {
-		return fmt.Errorf("invalid mount dst path: can not mount outside jail root: %s", dst)
-	}
-
+func (j *Jail) Mount(src, dst, owner, group, modeStr string, readWrite bool, dangerousAllowLinks bool) error {
 	uid, ok := j.UidMaps[owner]
 	if !ok {
 		return fmt.Errorf("unknown owner user %s in jail %s", owner, j.Name)
@@ -745,21 +757,53 @@ func (j *Jail) Mount(src, dst, owner, group, modeStr string) error {
 		return fmt.Errorf("unknown group %s in jail %s", group, j.Name)
 	}
 
+	srcStat, err := os.Stat(src)
+	if err != nil {
+		return err
+	}
+
+	src, err = filepath.Abs(src)
+	if err != nil {
+		return err
+	}
+
+	if !dangerousAllowLinks && !srcStat.Mode().IsRegular() {
+		return fmt.Errorf("will not copy links: %v", src)
+	}
+
+	hostDestPath := safePathJoin(j.Root, dst)
+	if len(hostDestPath) == 0 {
+		return fmt.Errorf("invalid mount dst path: can not mount outside jail root: %s", dst)
+	}
+
 	mode, err := strconv.ParseUint(modeStr, 8, 32)
 	if err != nil {
 		return err
 	}
 
-	err = os.Mkdir(hostDestPath, os.FileMode(mode))
-	if err != nil {
-		if !os.IsExist(err) {
-			return err
+	var mntOptions string
+
+	if srcStat.IsDir() {
+		err = os.Mkdir(hostDestPath, os.FileMode(mode))
+		if err != nil {
+			if !os.IsExist(err) {
+				return err
+			}
 		}
+
+		mntOptions = "nosuid,noexec,nodev,"
+	} else {
+		mntOptions = ""
 	}
 
-	_, _, err = runCmd(&CmdOptions{
+	mask := "ro"
+	if readWrite {
+		mask = "rw"
+	}
+
+	_, _, err = RunCmd(&CmdOptions{
 		Path: "/sbin/mount",
-		Args: []string{"-t", "nullfs", "-o", "nosuid,noexec,nodev", src, hostDestPath},
+		Args: []string{"-t", "nullfs", "-o", mntOptions + mask, src, hostDestPath},
 	})
 	if err != nil {
 		return err

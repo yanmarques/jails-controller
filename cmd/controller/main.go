@@ -17,7 +17,6 @@ func main() {
 
 	flag.Parse()
 
-	log.SetFlags(log.LstdFlags | log.Ldate | log.Lshortfile)
 	log.Printf("config path: %s\n", *configPath)
 
 	reconciler := core.NewReconcilerOrFail(*configPath)

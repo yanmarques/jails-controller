@@ -27,7 +27,7 @@ func NewZfs(root string) *Zfs {
 func (z *Zfs) Clone(src, dst string, existOk bool) error {
 	srcSet := z.ToDataset(src)
 	dstSet := z.ToDataset(dst)
-	_, _, err := runCmd(&CmdOptions{
+	_, _, err := RunCmd(&CmdOptions{
 		Path: "/sbin/zfs",
 		Args: []string{"list", "-t", "snapshot", srcSet},
 	})
@@ -35,7 +35,7 @@ func (z *Zfs) Clone(src, dst string, existOk bool) error {
 		return fmt.Errorf("no such snapshot: %s: %v", srcSet, err)
 	}
 
-	_, stderr, err := runCmd(&CmdOptions{
+	_, stderr, err := RunCmd(&CmdOptions{
 		Path: "/sbin/zfs",
 		Args: []string{"clone", srcSet, dstSet},
 	})
@@ -60,7 +60,7 @@ func (z *Zfs) Clone(src, dst string, existOk bool) error {
 
 func (z *Zfs) CreateSnapshot(dataset, snapName string, existOk bool) error {
 	snapshot := z.ToDataset(dataset + "@" + snapName)
-	_, stderr, err := runCmd(&CmdOptions{
+	_, stderr, err := RunCmd(&CmdOptions{
 		Path: "/sbin/zfs",
 		Args: []string{"snapshot", snapshot},
 	})
@@ -84,7 +84,7 @@ func (z *Zfs) CreateSnapshot(dataset, snapName string, existOk bool) error {
 }
 
 func (z *Zfs) Destroy(filesystem string, notExistsOk bool) error {
-	_, stderr, err := runCmd(&CmdOptions{
+	_, stderr, err := RunCmd(&CmdOptions{
 		Path: "/sbin/zfs",
 		Args: []string{"destroy", z.ToDataset(filesystem)},
 	})
@@ -103,7 +103,7 @@ func (z *Zfs) Destroy(filesystem string, notExistsOk bool) error {
 
 func (z *Zfs) ListFilesystems(root string) (map[string]*VolumeManifest, error) {
 	rootSet := z.ToDataset(root)
-	stdout, _, err := runCmd(&CmdOptions{
+	stdout, _, err := RunCmd(&CmdOptions{
 		Path: "/sbin/zfs",
 		Args: []string{"list", "-o", "name,quota",
 			"-t", "filesystem", "-H", "-d", "1", "-r", rootSet},
@@ -148,7 +148,7 @@ func (z *Zfs) Set(options *ZfsCreateOptions) error {
 
 	args = append(args, z.ToDataset(options.Filesystem))
 
-	_, _, err := runCmd(&CmdOptions{
+	_, _, err := RunCmd(&CmdOptions{
 		Path: "/sbin/zfs",
 		Args: args,
 	})
@@ -172,7 +172,7 @@ func (z *Zfs) Create(options *ZfsCreateOptions) error {
 
 	args = append(args, z.ToDataset(options.Filesystem))
 
-	_, stderr, err := runCmd(&CmdOptions{
+	_, stderr, err := RunCmd(&CmdOptions{
 		Path: "/sbin/zfs",
 		Args: args,
 	})
