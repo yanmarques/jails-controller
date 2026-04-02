@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -13,6 +14,7 @@ import (
 	"io"
 	"log"
 	"net/netip"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -49,7 +51,9 @@ type Reconciler struct {
 	Config    Config
 	Zfs       *Zfs
 	Notifier  *LazyEventNotifier
+	Rctl      *JailResourceManager
 	Keypair   Keypair
+	FirstRun  bool
 }
 
 type ErrAggregator struct {
@@ -144,15 +148,28 @@ type Subscriber struct {
 	Subscription EventSubscription
 }
 
+// Only parameters that are considered for state changes
+type HasheableManifest struct {
+	Base              string
+	StaticIp          string
+	Params            JailParams
+	EventSubscription EventSubscription
+	Actions           []JailAction
+	Mounts            []JailMount
+	Hints             map[string]string
+}
+
 type Manifest struct {
 	Type              string
-	Disabled          bool
 	Name              string
 	Base              string
 	Params            JailUserParams
 	EventSubscription EventSubscription
 	Actions           []JailAction
 	Mounts            []JailMount
+	Rlimits           []ResourceLimit
+	Hints             map[string]string
+	StaticIp          string
 
 	// metadata used internally to copy files
 	originalHostPath string
@@ -167,8 +184,9 @@ type VolumeManifest struct {
 }
 
 type IPSlot struct {
-	IP    netip.Addr
-	InUse bool
+	IP       netip.Addr
+	InUse    bool
+	Consumer string
 }
 
 type IPManager struct {
@@ -178,14 +196,41 @@ type IPManager struct {
 }
 
 type EventJailSync struct {
-	Name   string
-	IpAddr string
+	Name     string
+	Hostname string
+	IpAddr   string
+	Hints    map[string]string
 }
 
 type EventSyncState struct {
 	Signature    string
 	Verification string
 	Jails        []EventJailSync
+}
+
+func (m *Manifest) Hash() (string, error) {
+	params, err := m.Params.JailParams()
+	if err != nil {
+		return "", err
+	}
+
+	manifest := HasheableManifest{
+		Base:              m.Base,
+		StaticIp:          m.StaticIp,
+		Params:            params,
+		EventSubscription: m.EventSubscription,
+		Actions:           m.Actions,
+		Mounts:            m.Mounts,
+		Hints:             m.Hints,
+	}
+
+	out, err := json.Marshal(&manifest)
+	if err != nil {
+		return "", err
+	}
+
+	sum := sha256.Sum256(out)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func NewState() *State {
@@ -235,6 +280,46 @@ func (c JailUserParams) JailParams() (JailParams, error) {
 	return params, nil
 }
 
+func ValidHostname(hostname string) bool {
+	if hostname == "" {
+		return false
+	}
+
+	if strings.TrimSpace(hostname) == "" {
+		return false
+	}
+
+	if len(hostname) > 512 {
+		return false
+	}
+
+	parsedUrl, err := url.Parse("https://" + hostname + "/")
+	if err != nil {
+		return false
+	}
+
+	if parsedUrl.Host != hostname {
+		return false
+	}
+
+	if !((hostname[0] >= 'a' && hostname[0] <= 'z') ||
+		(hostname[0] >= 'A' && hostname[0] <= 'Z') ||
+		(hostname[0] >= '0' && hostname[0] <= '9')) {
+		return false
+	}
+
+	for _, char := range hostname {
+		if !((char >= 'a' && char <= 'z') ||
+			(char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') ||
+			char == '-') {
+			return false
+		}
+	}
+
+	return true
+}
+
 func RunCmd(options *CmdOptions) ([]byte, []byte, error) {
 	if options.Timeout <= 0 {
 		options.Timeout = DEFAULT_CMD_TIMEOUT_SMALL
@@ -260,7 +345,7 @@ func RunCmd(options *CmdOptions) ([]byte, []byte, error) {
 
 	// this WaitDelay addresses a bug on Go command execution,
 	// maybe on FreeBSD only, when an open file descriptor is not
-	// closed by the callee process (identified here by [`command`]),
+	// closed by the callee process (identified here by [`options.Path`]),
 	// causing Go I/O coroutines to wait forever.
 	cmd.WaitDelay = time.Duration(DEFAULT_CMD_TIMEOUT_SMALL) * time.Second
 
@@ -340,10 +425,12 @@ func NewIPManager(prefix string) (*IPManager, error) {
 	}, nil
 }
 
-func (i *IPManager) AllocateIP() (*netip.Addr, error) {
-	for idx, slot := range i.Slots {
-		if !slot.InUse {
-			i.Slots[idx].InUse = true
+func (i *IPManager) AllocateIP(consumer string) (*netip.Addr, error) {
+	for idx := range i.Slots {
+		slot := &i.Slots[idx]
+		if slot.Consumer == consumer || !slot.InUse {
+			slot.InUse = true
+			slot.Consumer = consumer
 			return &slot.IP, nil
 		}
 	}
@@ -363,17 +450,19 @@ func (i *IPManager) AllocateIP() (*netip.Addr, error) {
 
 	i.LastSlot = len(i.Slots)
 	i.Slots = append(i.Slots, IPSlot{
-		IP:    addr,
-		InUse: true,
+		IP:       addr,
+		InUse:    true,
+		Consumer: consumer,
 	})
 
 	return &addr, nil
 }
 
 func (i *IPManager) Free(ipAddr netip.Addr) error {
-	for idx, slot := range i.Slots {
+	for idx := range i.Slots {
+		slot := &i.Slots[idx]
 		if slot.IP == ipAddr {
-			i.Slots[idx].InUse = false
+			slot.InUse = false
 			return nil
 		}
 	}
@@ -381,13 +470,18 @@ func (i *IPManager) Free(ipAddr netip.Addr) error {
 	return fmt.Errorf("unknown IP address: %v", ipAddr)
 }
 
-func (i *IPManager) Import(ipAddr netip.Addr) error {
+func (i *IPManager) Reserve(consumer string, ipAddr netip.Addr) error {
 	if !i.Network.Contains(ipAddr) {
 		return fmt.Errorf("IP address %v is outside the network: %v", ipAddr.String(), i.Network.String())
 	}
 
-	for idx, slot := range i.Slots {
+	for idx := range i.Slots {
+		slot := &i.Slots[idx]
 		if slot.IP == ipAddr {
+			if slot.Consumer != consumer {
+				return fmt.Errorf("ip address %s already reserved for: %s", ipAddr.String(), consumer)
+			}
+
 			i.Slots[idx].InUse = true
 			return nil
 		}
@@ -401,8 +495,9 @@ func (i *IPManager) Import(ipAddr netip.Addr) error {
 	}
 
 	i.Slots = append(i.Slots, IPSlot{
-		IP:    ipAddr,
-		InUse: true,
+		IP:       ipAddr,
+		InUse:    true,
+		Consumer: consumer,
 	})
 
 	return nil
@@ -561,6 +656,20 @@ func (d *DesiredState) addJail(path string, jail *Manifest) error {
 		jail.EventSubscription.ServerFingerprint = hex.EncodeToString(fingerprint[:])
 	}
 
+	for idx := range jail.Rlimits {
+		err := jail.Rlimits[idx].Validate()
+		if err != nil {
+			return err
+		}
+	}
+
+	if jail.StaticIp != "" {
+		_, err := netip.ParseAddr(jail.StaticIp)
+		if err != nil {
+			return fmt.Errorf("invalid static ip %s in jail manifest %s", jail.StaticIp, jail.Name)
+		}
+	}
+
 	for idx, action := range jail.Actions {
 		if action.BeforeStart {
 			continue
@@ -640,11 +749,6 @@ func (r *Reconciler) decodeFile(path string, content []byte, desiredState *Desir
 	var manifest Manifest
 	err := decoder.Decode(&manifest)
 	if err == nil {
-		if manifest.Disabled {
-			log.Printf("manifest is marked disabled %s", path)
-			return nil
-		}
-
 		switch manifest.Type {
 		case "image":
 			return desiredState.addImage(path, &manifest)
@@ -828,13 +932,46 @@ func (r *Reconciler) Reconcile() {
 		}
 	}
 
+	imagestoCreate := []*Manifest{}
+	imagestoDestroy := []string{}
 	jailstoCreate := []*Manifest{}
 	jailstoDestroy := []*Jail{}
+	existingJailsToRecreate := map[string]bool{}
+	existingJailsToRctl := []*Manifest{}
 
-	for _, manifest := range desiredState.Jails {
-		_, exists := r.State.Jails[manifest.Name]
+	for name, manifest := range desiredState.Images {
+		_, exists := r.State.Images[name]
 		if exists {
 			continue
+		}
+
+		imagestoCreate = append(imagestoCreate, manifest)
+	}
+
+	for _, name := range r.State.Images {
+		_, alive := desiredState.Images[name]
+		if !alive {
+			imagestoDestroy = append(imagestoDestroy, name)
+		}
+	}
+
+	for _, manifest := range desiredState.Jails {
+		existingJail, exists := r.State.Jails[manifest.Name]
+		if exists {
+			manifestHash, err := manifest.Hash()
+			if err != nil {
+				oops.Err(err)
+				break
+			}
+
+			existingJailsToRctl = append(existingJailsToRctl, manifest)
+
+			if existingJail.Hash == manifestHash {
+				continue
+			}
+
+			jailstoDestroy = append(jailstoDestroy, existingJail)
+			existingJailsToRecreate[manifest.Name] = true
 		}
 
 		jailstoCreate = append(jailstoCreate, manifest)
@@ -846,13 +983,16 @@ func (r *Reconciler) Reconcile() {
 	for _, jail := range r.State.Jails {
 		_, alive := desiredState.Jails[jail.Name]
 		if alive {
-			for _, volume := range jail.Mounts {
-				volumeClaims[volume] = append(volumeClaims[volume], jail.Name)
+			// if will recreate, can skip account for volume claims verification for this jail
+			_, willRecreate := existingJailsToRecreate[jail.Name]
+			if !willRecreate {
+				for _, volume := range jail.Mounts {
+					volumeClaims[volume] = append(volumeClaims[volume], jail.Name)
+				}
 			}
-			continue
+		} else {
+			jailstoDestroy = append(jailstoDestroy, jail)
 		}
-
-		jailstoDestroy = append(jailstoDestroy, jail)
 	}
 
 	for volume, claims := range volumeClaims {
@@ -864,18 +1004,26 @@ func (r *Reconciler) Reconcile() {
 
 	log.Printf("jails to create %v, existing jails %v", len(jailstoCreate), len(r.State.Jails))
 
+	for _, manifest := range existingJailsToRctl {
+		// TODO: what do I want to do here on failure?
+		err = oops.Err(r.Rctl.Add(manifest.Name, manifest.Rlimits))
+	}
+
 	// destroy jails
 	for _, jail := range jailstoDestroy {
 		oops.Err(r.JailIpam.Free(jail.IpAddr))
+		hasErr := false
 
 		// TODO: track jails already shutdown, otherwise it will be stuck on this call
 		err = oops.Err(jail.Shutdown())
-		if err != nil {
-			continue
-		}
+		hasErr = hasErr || err != nil
+
+		err = oops.Err(r.Rctl.DestroyAll(jail.Name))
+		hasErr = hasErr || err != nil
 
 		err = oops.Err(jail.Destroy())
-		if err == nil {
+		hasErr = hasErr || err != nil
+		if !hasErr {
 			delete(r.State.Jails, jail.Name)
 			delete(r.State.Subscribers, jail.Name)
 		}
@@ -897,12 +1045,7 @@ func (r *Reconciler) Reconcile() {
 	}
 
 	// destroy images
-	for _, image := range r.State.Images {
-		_, alive := desiredState.Images[image]
-		if alive {
-			continue
-		}
-
+	for _, image := range imagestoDestroy {
 		err = oops.Err(r.Zfs.Destroy("images/"+image+"@base", true))
 		if err != nil {
 			continue
@@ -917,19 +1060,28 @@ func (r *Reconciler) Reconcile() {
 	}
 
 	// create images
-	for name, manifest := range desiredState.Images {
-		_, ok := r.State.Images[name]
-		if ok {
-			continue
-		}
-
-		ipAddr, err := r.ImageIpam.AllocateIP()
+	for _, manifest := range imagestoCreate {
+		ipAddr, err := r.ImageIpam.AllocateIP(manifest.Name)
 		if err != nil {
 			oops.Err(err)
 			break
 		}
 
-		jail, err := NewJail(manifest, r.Zfs, r.Config, "images", *ipAddr)
+		randomId := make([]byte, 2)
+		rand.Read(randomId)
+
+		jailName := manifest.Name + "-image-" + hex.EncodeToString(randomId)
+
+		jail, err := NewJail(&JailOptions{
+			Name:     jailName,
+			Manifest: manifest,
+			Zfs:      r.Zfs,
+			Config:   r.Config,
+			ZfsSet:   "images",
+			IpAddr:   *ipAddr,
+			Hash:     "",
+			Hints:    manifest.Hints,
+		})
 		if err != nil {
 			oops.Err(err)
 			oops.Err(r.ImageIpam.Free(*ipAddr))
@@ -958,7 +1110,7 @@ func (r *Reconciler) Reconcile() {
 		if err != nil {
 			oops.Err(jail.Destroy())
 		} else {
-			r.State.Images[name] = name
+			r.State.Images[manifest.Name] = manifest.Name
 		}
 	}
 
@@ -1003,20 +1155,71 @@ func (r *Reconciler) Reconcile() {
 		}
 	}
 
+	// reserve all static IPs
+	for _, manifest := range jailstoCreate {
+		if manifest.StaticIp != "" {
+			ip, err := netip.ParseAddr(manifest.StaticIp)
+			if err != nil {
+				oops.Err(err)
+				break
+			}
+
+			err = oops.Err(r.JailIpam.Reserve(manifest.Name, ip))
+			if err != nil {
+				break
+			}
+		}
+	}
+
 	// create jails
 	for _, manifest := range jailstoCreate {
 		log.Printf("jails will be created %v", manifest.Name)
 
-		ipAddr, err := r.JailIpam.AllocateIP()
+		useDynamicIp := false
+		var ipAddr netip.Addr
+
+		if manifest.StaticIp != "" {
+			useDynamicIp = true
+			ipAddr, err = netip.ParseAddr(manifest.StaticIp)
+			if err != nil {
+				oops.Err(err)
+				break
+			}
+		} else {
+			ip, err := r.JailIpam.AllocateIP(manifest.Name)
+			if err != nil {
+				oops.Err(err)
+				break
+			}
+
+			ipAddr = *ip
+		}
+
 		if err != nil {
 			oops.Err(err)
 			break
 		}
 
-		jail, err := NewJail(manifest, r.Zfs, r.Config, "containers", *ipAddr)
+		hash, err := manifest.Hash()
 		if err != nil {
 			oops.Err(err)
-			oops.Err(r.JailIpam.Free(*ipAddr))
+			break
+		}
+
+		jail, err := NewJail(&JailOptions{
+			Manifest: manifest,
+			Zfs:      r.Zfs,
+			Config:   r.Config,
+			ZfsSet:   "containers",
+			IpAddr:   ipAddr,
+			Hash:     hash,
+			Hints:    manifest.Hints,
+		})
+		if err != nil {
+			oops.Err(err)
+			if useDynamicIp {
+				oops.Err(r.JailIpam.Free(ipAddr))
+			}
 			break
 		}
 
@@ -1025,7 +1228,9 @@ func (r *Reconciler) Reconcile() {
 			oops.Err(err)
 			oops.Err(jail.Shutdown())
 			oops.Err(jail.Destroy())
-			oops.Err(r.JailIpam.Free(*ipAddr))
+			if useDynamicIp {
+				oops.Err(r.JailIpam.Free(ipAddr))
+			}
 			break
 		}
 
@@ -1035,7 +1240,9 @@ func (r *Reconciler) Reconcile() {
 				oops.Err(err)
 				oops.Err(jail.Shutdown())
 				oops.Err(jail.Destroy())
-				oops.Err(r.JailIpam.Free(*ipAddr))
+				if useDynamicIp {
+					oops.Err(r.JailIpam.Free(ipAddr))
+				}
 				break
 			}
 		}
@@ -1045,7 +1252,21 @@ func (r *Reconciler) Reconcile() {
 			oops.Err(err)
 			oops.Err(jail.Shutdown())
 			oops.Err(jail.Destroy())
-			oops.Err(r.JailIpam.Free(*ipAddr))
+			if useDynamicIp {
+				oops.Err(r.JailIpam.Free(ipAddr))
+			}
+			break
+		}
+
+		err = oops.Err(r.Rctl.Add(jail.Name, manifest.Rlimits))
+		if err != nil {
+			oops.Err(err)
+			oops.Err(jail.Shutdown())
+			oops.Err(jail.Destroy())
+			if useDynamicIp {
+				oops.Err(r.JailIpam.Free(ipAddr))
+			}
+
 			break
 		}
 
@@ -1054,7 +1275,9 @@ func (r *Reconciler) Reconcile() {
 			oops.Err(err)
 			oops.Err(jail.Shutdown())
 			oops.Err(jail.Destroy())
-			oops.Err(r.JailIpam.Free(*ipAddr))
+			if useDynamicIp {
+				oops.Err(r.JailIpam.Free(ipAddr))
+			}
 		} else {
 			// add jail to internal state
 			r.State.Jails[jail.Name] = jail
@@ -1075,7 +1298,7 @@ func (r *Reconciler) Reconcile() {
 		}
 	}
 
-	if len(jailstoCreate)+len(jailstoDestroy) > 0 {
+	if len(jailstoCreate)+len(jailstoDestroy) > 0 || r.FirstRun {
 		msg := make([]byte, 32)
 		rand.Read(msg)
 
@@ -1088,9 +1311,17 @@ func (r *Reconciler) Reconcile() {
 		}
 
 		for _, jail := range r.State.Jails {
+			hostname, ok := jail.Hostname()
+			if !ok {
+				log.Printf("somehow, jail does not have a hostname: %s", jail.Name)
+				continue
+			}
+
 			jailsSync.Jails = append(jailsSync.Jails, EventJailSync{
-				Name:   jail.Name,
-				IpAddr: jail.IpAddr.String(),
+				Name:     jail.Name,
+				Hostname: hostname,
+				IpAddr:   jail.IpAddr.String(),
+				Hints:    jail.Hints,
 			})
 		}
 
@@ -1127,6 +1358,7 @@ func (r *Reconciler) Reconcile() {
 	}
 
 	r.State.LastTag = currentGitTag.Hash.String()
+	r.FirstRun = false
 }
 
 func ParseEventSync(body []byte, pubKey ed25519.PublicKey) (*EventSyncState, error) {
@@ -1154,9 +1386,9 @@ func ParseEventSync(body []byte, pubKey ed25519.PublicKey) (*EventSyncState, err
 	return &event, nil
 }
 
-// TODO: i dislike this but now it's too late?
 func InitLogging() {
 	log.SetFlags(log.LstdFlags | log.Ldate | log.Lshortfile)
+	// TODO: i dislike this but now it's too late?
 	oops = NewErrAggregator()
 }
 
@@ -1379,15 +1611,15 @@ func NewReconcilerOrFail(configPath string) *Reconciler {
 			hadErrors = true
 		} else {
 			if result != nil {
-				err = oops.Err(jailIpam.Import(result.Jail.IpAddr))
+				err = oops.Err(jailIpam.Reserve(name, result.Jail.IpAddr))
 				if err == nil {
 					log.Printf("imported jails %v", name)
 					state.Jails[name] = result.Jail
 
-					if !result.Events.Empty() {
+					if !result.Meta.Events.Empty() {
 						state.Subscribers[name] = Subscriber{
 							Jail:         result.Jail,
-							Subscription: *result.Events,
+							Subscription: result.Meta.Events,
 						}
 					}
 				} else {
@@ -1419,6 +1651,12 @@ func NewReconcilerOrFail(configPath string) *Reconciler {
 		state.Images[vol.Name] = vol.Name
 	}
 
+	rctl := NewJailResourceManager()
+	err = rctl.Import()
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	reconciler := &Reconciler{
 		State:     state,
 		ImageIpam: imageIpam,
@@ -1426,11 +1664,13 @@ func NewReconcilerOrFail(configPath string) *Reconciler {
 		Config:    config,
 		Repo:      repo,
 		Zfs:       zfs,
-		Notifier:  NewEventNotifier(5, 15*time.Second),
+		Notifier:  NewEventNotifier(10, 5*time.Second),
+		Rctl:      rctl,
 		Keypair: Keypair{
 			Priv: privKey,
 			Pub:  pubKey,
 		},
+		FirstRun: true,
 	}
 
 	return reconciler

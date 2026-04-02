@@ -30,7 +30,8 @@ type JailMeta struct {
 	Magic      string
 	JailParams JailParams
 	Events     EventSubscription
-	ServerCert string
+	Hash       string
+	Hints      map[string]string
 }
 
 type Jail struct {
@@ -44,8 +45,9 @@ type Jail struct {
 	ExecUser      IdMap
 	UidMaps       map[string]IdMap
 	GidMaps       map[string]IdMap
-	// only populated for jails created by us, not imported
-	Params JailParams
+	Hash          string
+	Params        JailParams
+	Hints         map[string]string
 }
 
 type Epair struct {
@@ -68,9 +70,19 @@ type NetstatStats struct {
 }
 
 type JailImportResult struct {
-	Jail   *Jail
-	Events *EventSubscription
-	ApiKey string
+	Jail *Jail
+	Meta *JailMeta
+}
+
+type JailOptions struct {
+	Name     string
+	Manifest *Manifest
+	Zfs      *Zfs
+	Config   Config
+	ZfsSet   string
+	IpAddr   netip.Addr
+	Hash     string
+	Hints    map[string]string
 }
 
 func EpairCreate() (*Epair, error) {
@@ -223,11 +235,13 @@ func JailImport(name string, zfs *Zfs, zfsMountpoint, zfsSet string) (*JailImpor
 		UidMaps:       uids,
 		GidMaps:       gids,
 		Params:        jailMeta.JailParams,
+		Hash:          jailMeta.Hash,
+		Hints:         jailMeta.Hints,
 	}
 
 	return &JailImportResult{
-		Jail:   &jail,
-		Events: &jailMeta.Events,
+		Jail: &jail,
+		Meta: &jailMeta,
 	}, nil
 }
 
@@ -350,25 +364,30 @@ func parseIdentity(uidMap *IdMap, uids *map[string]IdMap, gids *map[string]IdMap
 	return nil
 }
 
-func NewJail(manifest *Manifest, zfs *Zfs, config Config, zfsSet string, ipAddr netip.Addr) (*Jail, error) {
-	zfsSource := zfsSet + "/" + manifest.Name
+func NewJail(options *JailOptions) (*Jail, error) {
+	jailName := options.Name
+	if jailName == "" {
+		jailName = options.Manifest.Name
+	}
+
+	zfsSource := options.ZfsSet + "/" + options.Manifest.Name
 
 	log.Printf("creating jail %s", zfsSource)
 
-	err := zfs.CreateSnapshot(manifest.Base, "base", true)
+	err := options.Zfs.CreateSnapshot(options.Manifest.Base, "base", true)
 	if err != nil {
 		return nil, err
 	}
 
-	err = zfs.Clone(manifest.Base+"@base", zfsSource, false)
+	err = options.Zfs.Clone(options.Manifest.Base+"@base", zfsSource, false)
 	if err != nil {
 		if os.IsExist(err) {
-			err = zfs.Destroy(zfsSource, false)
+			err = options.Zfs.Destroy(zfsSource, false)
 			if err != nil {
 				return nil, err
 			}
 
-			err = zfs.Clone(manifest.Base+"@base", zfsSource, false)
+			err = options.Zfs.Clone(options.Manifest.Base+"@base", zfsSource, false)
 			if err != nil {
 				return nil, err
 			}
@@ -379,13 +398,13 @@ func NewJail(manifest *Manifest, zfs *Zfs, config Config, zfsSet string, ipAddr 
 
 	epair, err := EpairCreate()
 	if err != nil {
-		zfs.Destroy(zfsSource, false)
+		options.Zfs.Destroy(zfsSource, false)
 		return nil, err
 	}
 
-	params, err := manifest.Params.JailParams()
+	params, err := options.Manifest.Params.JailParams()
 	if err != nil {
-		zfs.Destroy(zfsSource, false)
+		options.Zfs.Destroy(zfsSource, false)
 		return nil, err
 	}
 
@@ -393,9 +412,9 @@ func NewJail(manifest *Manifest, zfs *Zfs, config Config, zfsSet string, ipAddr 
 	var gids map[string]IdMap
 	var uidMap IdMap
 
-	err = parseIdentity(&uidMap, &uids, &gids, manifest.Name, params, config.ZfsMountpoint, zfsSource)
+	err = parseIdentity(&uidMap, &uids, &gids, jailName, params, options.Config.ZfsMountpoint, zfsSource)
 	if err != nil {
-		zfs.Destroy(zfsSource, false)
+		options.Zfs.Destroy(zfsSource, false)
 		return nil, err
 	}
 
@@ -404,21 +423,27 @@ func NewJail(manifest *Manifest, zfs *Zfs, config Config, zfsSet string, ipAddr 
 
 	_, ok := params["host.hostname"]
 	if !ok {
-		params["host.hostname"] = manifest.Name
+		params["host.hostname"] = jailName
 	}
 
-	root := filepath.Join(config.ZfsMountpoint, zfsSource)
+	if !ValidHostname(params["host.hostname"]) {
+		options.Zfs.Destroy(zfsSource, false)
+		return nil, fmt.Errorf("invalid jail hostname: %s", params["host.hostname"])
+	}
 
-	params["name"] = manifest.Name
+	root := filepath.Join(options.Config.ZfsMountpoint, zfsSource)
+
+	params["name"] = jailName
 	params["vnet"] = ""
 	params["vnet.interface"] = epair.Jail
 	params["path"] = root
-	params["exec.consolelog"] = filepath.Join(config.LogDir, manifest.Name+"_console.log")
+	params["exec.consolelog"] = filepath.Join(options.Config.LogDir, options.Manifest.Name+"_console.log")
 
 	jailMeta := JailMeta{
 		Magic:      META_MARK,
 		JailParams: params,
-		Events:     manifest.EventSubscription,
+		Events:     options.Manifest.EventSubscription,
+		Hash:       options.Hash,
 	}
 
 	metadata, err := json.Marshal(jailMeta)
@@ -431,23 +456,30 @@ func NewJail(manifest *Manifest, zfs *Zfs, config Config, zfsSet string, ipAddr 
 
 	mounts := []string{}
 
-	for _, mnt := range manifest.Mounts {
+	for _, mnt := range options.Manifest.Mounts {
 		mounts = append(mounts, mnt.Volume)
 	}
 
 	return &Jail{
-		Name:          manifest.Name,
+		Name:          jailName,
 		Root:          root,
 		ZfsDatasource: zfsSource,
 		Interface:     epair,
-		IpAddr:        ipAddr,
+		IpAddr:        options.IpAddr,
 		Mounts:        mounts,
-		Zfs:           zfs,
+		Zfs:           options.Zfs,
 		ExecUser:      uidMap,
 		UidMaps:       uids,
 		GidMaps:       gids,
 		Params:        params,
+		Hash:          options.Hash,
+		Hints:         options.Hints,
 	}, nil
+}
+
+func (j *Jail) Hostname() (string, bool) {
+	h, ok := j.Params["host.hostname"]
+	return h, ok
 }
 
 func (j *Jail) Start() error {

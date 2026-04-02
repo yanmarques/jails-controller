@@ -9,7 +9,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -18,6 +20,10 @@ import (
 )
 
 const DEFAULT_ZONEFILE_MODE = 0644
+
+// Invalid because unbound authority zones already use those,
+// and overriding them would be bad
+var RESERVED_HOSTNAMES = []string{"ns", "admin"}
 
 func main() {
 	core.InitLogging()
@@ -133,7 +139,26 @@ ns IN NS ` + selfIpAddr.String() + `
 
 		// TODO: validate against invalid names, like ns or admin
 		for _, jail := range event.Jails {
-			_, err = records.WriteString(jail.Name + "\tIN A\t" + jail.IpAddr + "\n")
+			if !core.ValidHostname(jail.Name) {
+				log.Printf("[ERROR] invalid jail name: %s", jail.Name)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+
+			if slices.Contains(RESERVED_HOSTNAMES, jail.Name) {
+				log.Printf("[ERROR] jail name is reserved: %s", jail.Name)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+
+			ip, err := netip.ParseAddr(jail.IpAddr)
+			if err != nil {
+				log.Printf("[ERROR] jail ip addr is invalid: %s", jail.IpAddr)
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+
+			_, err = records.WriteString(jail.Name + "\tIN A\t" + ip.String() + "\n")
 			if err != nil {
 				log.Printf("building new unbound conf: %v", err)
 				w.WriteHeader(http.StatusInternalServerError)
