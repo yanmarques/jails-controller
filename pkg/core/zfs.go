@@ -96,6 +96,8 @@ func (z *Zfs) Destroy(filesystem string, notExistsOk bool) error {
 
 			return err
 		}
+
+		return err
 	}
 
 	return nil

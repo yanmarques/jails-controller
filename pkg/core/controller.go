@@ -21,6 +21,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	git "github.com/go-git/go-git/v6"
@@ -34,26 +35,26 @@ import (
 const DEFAULT_CONFIG_PATH = "/usr/local/etc/jails-controllers.toml"
 const DEFAULT_IMAGE_CIDR = "10.100.0.0/16"
 const DEFAULT_JAIL_CIDR = "10.200.0.0/16"
-const PUBKEY_PATH_IN_JAIL = "/usr/local/etc/jails-controller.pubkey"
+const DEFAULT_CMD_TIMEOUT_SMALL = 60
+const DEFAULT_CMD_TIMEOUT_LARGE = 600
+
+const PUBKEY_PATH_IN_JAIL = "/etc/jails-controller.pubkey"
 const CONFIG_DIR = "/usr/local/etc/jails-controller"
 const PRIVKEY_PATH = CONFIG_DIR + "/controller.key"
 const PUBKEY_PATH = CONFIG_DIR + "/controller.pubkey"
-const DEFAULT_CMD_TIMEOUT_SMALL = 60
-const DEFAULT_CMD_TIMEOUT_LARGE = 600
 
 var oops *ErrAggregator
 
 type Reconciler struct {
-	Repo      *git.Repository
-	State     *State
-	ImageIpam *IPManager
-	JailIpam  *IPManager
-	Config    Config
-	Zfs       *Zfs
-	Notifier  *LazyEventNotifier
-	Rctl      *JailResourceManager
-	Keypair   Keypair
-	FirstRun  bool
+	Repo     *git.Repository
+	State    *State
+	Ipam     map[string]*IPManager
+	Config   Config
+	Zfs      *Zfs
+	Notifier *LazyEventNotifier
+	Rctl     *JailResourceManager
+	Keypair  Keypair
+	FirstRun bool
 }
 
 type ErrAggregator struct {
@@ -71,6 +72,11 @@ type CmdOptions struct {
 type Keypair struct {
 	Priv ed25519.PrivateKey
 	Pub  ed25519.PublicKey
+}
+
+type Subnet struct {
+	Id   string
+	Cidr string
 }
 
 type Config struct {
@@ -91,6 +97,7 @@ type Config struct {
 	LogDir string
 
 	PrivateKeyPath string
+	Subnets        []Subnet
 }
 
 type State struct {
@@ -151,12 +158,17 @@ type Subscriber struct {
 // Only parameters that are considered for state changes
 type HasheableManifest struct {
 	Base              string
-	StaticIp          string
+	Network           NetworkManifest
 	Params            JailParams
 	EventSubscription EventSubscription
 	Actions           []JailAction
 	Mounts            []JailMount
 	Hints             map[string]string
+}
+
+type NetworkManifest struct {
+	SubnetId string
+	StaticIp string
 }
 
 type Manifest struct {
@@ -169,7 +181,7 @@ type Manifest struct {
 	Mounts            []JailMount
 	Rlimits           []ResourceLimit
 	Hints             map[string]string
-	StaticIp          string
+	Network           NetworkManifest
 
 	// metadata used internally to copy files
 	originalHostPath string
@@ -216,7 +228,7 @@ func (m *Manifest) Hash() (string, error) {
 
 	manifest := HasheableManifest{
 		Base:              m.Base,
-		StaticIp:          m.StaticIp,
+		Network:           m.Network,
 		Params:            params,
 		EventSubscription: m.EventSubscription,
 		Actions:           m.Actions,
@@ -332,6 +344,10 @@ func RunCmd(options *CmdOptions) ([]byte, []byte, error) {
 	var stderr bytes.Buffer
 
 	cmd := exec.CommandContext(ctx, options.Path, options.Args...)
+
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true,
+	}
 
 	if options.CloseFds {
 		cmd.Stdin = nil
@@ -573,7 +589,11 @@ func PrepareJailBeforeStart(jail *Jail, hostPath string, actions []JailAction, m
 				return err
 			}
 		default:
-			return fmt.Errorf("unknown action type: %v", action.Type)
+			if action.Type == "" {
+				return fmt.Errorf("empty action type in jail %s", jail.Name)
+			}
+
+			return fmt.Errorf("unknown action type %v in jail %s", action.Type, jail.Name)
 		}
 	}
 
@@ -608,7 +628,11 @@ func PrepareJailAfterStart(jail *Jail, hostPath string, actions []JailAction, mo
 				return err
 			}
 		default:
-			return fmt.Errorf("unknown action type: %v", action.Type)
+			if action.Type == "" {
+				return fmt.Errorf("empty action type in jail %s", jail.Name)
+			}
+
+			return fmt.Errorf("unknown action type %v in jail %s", action.Type, jail.Name)
 		}
 	}
 
@@ -663,10 +687,14 @@ func (d *DesiredState) addJail(path string, jail *Manifest) error {
 		}
 	}
 
-	if jail.StaticIp != "" {
-		_, err := netip.ParseAddr(jail.StaticIp)
+	if jail.Network.SubnetId == "" {
+		jail.Network.SubnetId = "jails"
+	}
+
+	if jail.Network.StaticIp != "" {
+		_, err := netip.ParseAddr(jail.Network.StaticIp)
 		if err != nil {
-			return fmt.Errorf("invalid static ip %s in jail manifest %s", jail.StaticIp, jail.Name)
+			return fmt.Errorf("invalid static ip %s in jail manifest %s", jail.Network.StaticIp, jail.Name)
 		}
 	}
 
@@ -695,6 +723,10 @@ func (d *DesiredState) addImage(path string, image *Manifest) error {
 		return fmt.Errorf(
 			"manifest with empty image name: %v",
 			path)
+	}
+
+	if image.Network.SubnetId == "" {
+		image.Network.SubnetId = "images"
 	}
 
 	_, ok := d.Images[image.Name]
@@ -976,7 +1008,9 @@ func (r *Reconciler) Reconcile() {
 
 		jailstoCreate = append(jailstoCreate, manifest)
 		for _, mnt := range manifest.Mounts {
-			volumeClaims[mnt.Volume] = append(volumeClaims[mnt.Volume], manifest.Name)
+			if mnt.ReadWrite {
+				volumeClaims[mnt.Volume] = append(volumeClaims[mnt.Volume], manifest.Name)
+			}
 		}
 	}
 
@@ -986,8 +1020,10 @@ func (r *Reconciler) Reconcile() {
 			// if will recreate, can skip account for volume claims verification for this jail
 			_, willRecreate := existingJailsToRecreate[jail.Name]
 			if !willRecreate {
-				for _, volume := range jail.Mounts {
-					volumeClaims[volume] = append(volumeClaims[volume], jail.Name)
+				for _, mnt := range jail.Mounts {
+					if mnt.ReadWrite {
+						volumeClaims[mnt.Volume] = append(volumeClaims[mnt.Volume], jail.Name)
+					}
 				}
 			}
 		} else {
@@ -1011,7 +1047,13 @@ func (r *Reconciler) Reconcile() {
 
 	// destroy jails
 	for _, jail := range jailstoDestroy {
-		oops.Err(r.JailIpam.Free(jail.IpAddr))
+		ipam, ok := r.Ipam[jail.SubnetId]
+		if !ok {
+			oops.Err(fmt.Errorf("unkown subnet id %s for jails %s", jail.SubnetId, jail.Name))
+			continue
+		}
+
+		oops.Err(ipam.Free(jail.IpAddr))
 		hasErr := false
 
 		// TODO: track jails already shutdown, otherwise it will be stuck on this call
@@ -1061,7 +1103,13 @@ func (r *Reconciler) Reconcile() {
 
 	// create images
 	for _, manifest := range imagestoCreate {
-		ipAddr, err := r.ImageIpam.AllocateIP(manifest.Name)
+		ipam, ok := r.Ipam[manifest.Network.SubnetId]
+		if !ok {
+			oops.Err(fmt.Errorf("unkown subnet id %s for jails %s", manifest.Network.SubnetId, manifest.Name))
+			break
+		}
+
+		ipAddr, err := ipam.AllocateIP(manifest.Name)
 		if err != nil {
 			oops.Err(err)
 			break
@@ -1081,10 +1129,11 @@ func (r *Reconciler) Reconcile() {
 			IpAddr:   *ipAddr,
 			Hash:     "",
 			Hints:    manifest.Hints,
+			SubnetId: manifest.Network.SubnetId,
 		})
 		if err != nil {
 			oops.Err(err)
-			oops.Err(r.ImageIpam.Free(*ipAddr))
+			oops.Err(ipam.Free(*ipAddr))
 			break
 		}
 
@@ -1092,7 +1141,7 @@ func (r *Reconciler) Reconcile() {
 		if err != nil {
 			oops.Err(jail.Shutdown())
 			oops.Err(jail.Destroy())
-			oops.Err(r.ImageIpam.Free(*ipAddr))
+			oops.Err(ipam.Free(*ipAddr))
 			break
 		}
 
@@ -1100,7 +1149,7 @@ func (r *Reconciler) Reconcile() {
 		if err != nil {
 			oops.Err(jail.Shutdown())
 			oops.Err(jail.Destroy())
-			oops.Err(r.ImageIpam.Free(*ipAddr))
+			oops.Err(ipam.Free(*ipAddr))
 			break
 		}
 
@@ -1157,14 +1206,20 @@ func (r *Reconciler) Reconcile() {
 
 	// reserve all static IPs
 	for _, manifest := range jailstoCreate {
-		if manifest.StaticIp != "" {
-			ip, err := netip.ParseAddr(manifest.StaticIp)
+		ipam, ok := r.Ipam[manifest.Network.SubnetId]
+		if !ok {
+			oops.Err(fmt.Errorf("unknown subnet id %s for jails %s", manifest.Network.SubnetId, manifest.Name))
+			break
+		}
+
+		if manifest.Network.StaticIp != "" {
+			ip, err := netip.ParseAddr(manifest.Network.StaticIp)
 			if err != nil {
 				oops.Err(err)
 				break
 			}
 
-			err = oops.Err(r.JailIpam.Reserve(manifest.Name, ip))
+			err = oops.Err(ipam.Reserve(manifest.Name, ip))
 			if err != nil {
 				break
 			}
@@ -1174,19 +1229,24 @@ func (r *Reconciler) Reconcile() {
 	// create jails
 	for _, manifest := range jailstoCreate {
 		log.Printf("jails will be created %v", manifest.Name)
+		ipam, ok := r.Ipam[manifest.Network.SubnetId]
+		if !ok {
+			oops.Err(fmt.Errorf("unkown subnet id %s for jails %s", manifest.Network.SubnetId, manifest.Name))
+			break
+		}
 
 		useDynamicIp := false
 		var ipAddr netip.Addr
 
-		if manifest.StaticIp != "" {
+		if manifest.Network.StaticIp != "" {
 			useDynamicIp = true
-			ipAddr, err = netip.ParseAddr(manifest.StaticIp)
+			ipAddr, err = netip.ParseAddr(manifest.Network.StaticIp)
 			if err != nil {
 				oops.Err(err)
 				break
 			}
 		} else {
-			ip, err := r.JailIpam.AllocateIP(manifest.Name)
+			ip, err := ipam.AllocateIP(manifest.Name)
 			if err != nil {
 				oops.Err(err)
 				break
@@ -1214,11 +1274,12 @@ func (r *Reconciler) Reconcile() {
 			IpAddr:   ipAddr,
 			Hash:     hash,
 			Hints:    manifest.Hints,
+			SubnetId: manifest.Network.SubnetId,
 		})
 		if err != nil {
 			oops.Err(err)
 			if useDynamicIp {
-				oops.Err(r.JailIpam.Free(ipAddr))
+				oops.Err(ipam.Free(ipAddr))
 			}
 			break
 		}
@@ -1229,7 +1290,7 @@ func (r *Reconciler) Reconcile() {
 			oops.Err(jail.Shutdown())
 			oops.Err(jail.Destroy())
 			if useDynamicIp {
-				oops.Err(r.JailIpam.Free(ipAddr))
+				oops.Err(ipam.Free(ipAddr))
 			}
 			break
 		}
@@ -1241,7 +1302,7 @@ func (r *Reconciler) Reconcile() {
 				oops.Err(jail.Shutdown())
 				oops.Err(jail.Destroy())
 				if useDynamicIp {
-					oops.Err(r.JailIpam.Free(ipAddr))
+					oops.Err(ipam.Free(ipAddr))
 				}
 				break
 			}
@@ -1253,7 +1314,7 @@ func (r *Reconciler) Reconcile() {
 			oops.Err(jail.Shutdown())
 			oops.Err(jail.Destroy())
 			if useDynamicIp {
-				oops.Err(r.JailIpam.Free(ipAddr))
+				oops.Err(ipam.Free(ipAddr))
 			}
 			break
 		}
@@ -1264,7 +1325,7 @@ func (r *Reconciler) Reconcile() {
 			oops.Err(jail.Shutdown())
 			oops.Err(jail.Destroy())
 			if useDynamicIp {
-				oops.Err(r.JailIpam.Free(ipAddr))
+				oops.Err(ipam.Free(ipAddr))
 			}
 
 			break
@@ -1276,7 +1337,7 @@ func (r *Reconciler) Reconcile() {
 			oops.Err(jail.Shutdown())
 			oops.Err(jail.Destroy())
 			if useDynamicIp {
-				oops.Err(r.JailIpam.Free(ipAddr))
+				oops.Err(ipam.Free(ipAddr))
 			}
 		} else {
 			// add jail to internal state
@@ -1461,14 +1522,31 @@ func NewReconcilerOrFail(configPath string) *Reconciler {
 		pubKey = pubkeyContent
 	}
 
-	imageIpam, err := NewIPManager(DEFAULT_IMAGE_CIDR)
-	if err != nil {
-		log.Fatal(err)
+	ipam := map[string]*IPManager{}
+
+	for _, subnet := range config.Subnets {
+		manager, err := NewIPManager(subnet.Cidr)
+		if err != nil {
+			log.Fatal(err)
+		}
+
+		ipam[subnet.Id] = manager
 	}
 
-	jailIpam, err := NewIPManager(DEFAULT_JAIL_CIDR)
-	if err != nil {
-		log.Fatal(err)
+	_, ok := ipam["jails"]
+	if !ok {
+		ipam["jails"], err = NewIPManager(DEFAULT_JAIL_CIDR)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	_, ok = ipam["images"]
+	if !ok {
+		ipam["images"], err = NewIPManager(DEFAULT_IMAGE_CIDR)
+		if err != nil {
+			log.Fatal(err)
+		}
 	}
 
 	repo, err := git.PlainClone(config.Directory, &git.CloneOptions{
@@ -1611,7 +1689,16 @@ func NewReconcilerOrFail(configPath string) *Reconciler {
 			hadErrors = true
 		} else {
 			if result != nil {
-				err = oops.Err(jailIpam.Reserve(name, result.Jail.IpAddr))
+				if result.Jail.SubnetId == "" {
+					result.Jail.SubnetId = "jails"
+				}
+
+				ipam, ok := ipam[result.Jail.SubnetId]
+				if !ok {
+					log.Fatal(fmt.Errorf("unknown subnet id %s for imported jail %s", result.Jail.SubnetId, result.Jail.Name))
+				}
+
+				err = oops.Err(ipam.Reserve(name, result.Jail.IpAddr))
 				if err == nil {
 					log.Printf("imported jails %v", name)
 					state.Jails[name] = result.Jail
@@ -1658,14 +1745,13 @@ func NewReconcilerOrFail(configPath string) *Reconciler {
 	}
 
 	reconciler := &Reconciler{
-		State:     state,
-		ImageIpam: imageIpam,
-		JailIpam:  jailIpam,
-		Config:    config,
-		Repo:      repo,
-		Zfs:       zfs,
-		Notifier:  NewEventNotifier(10, 5*time.Second),
-		Rctl:      rctl,
+		State:    state,
+		Config:   config,
+		Ipam:     ipam,
+		Repo:     repo,
+		Zfs:      zfs,
+		Notifier: NewEventNotifier(10, 5*time.Second),
+		Rctl:     rctl,
 		Keypair: Keypair{
 			Priv: privKey,
 			Pub:  pubKey,

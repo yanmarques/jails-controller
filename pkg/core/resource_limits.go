@@ -63,7 +63,7 @@ func (r *ResourceLimit) Rule(jail string) string {
 		amount = string(byteStr)
 	}
 
-	return "jail:" + jail + ":" + r.Resource + ":" + r.Action + "/" + amount
+	return "jail:" + jail + ":" + r.Resource + ":" + r.Action + "=" + amount
 }
 
 func (r *ResourceLimit) Validate() error {

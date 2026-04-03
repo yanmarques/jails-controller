@@ -23,7 +23,7 @@ type Target struct {
 }
 
 const HINT_KEY = "metricsPort"
-const DEFAULT_TARGETSFILE_MODE = 0600
+const DEFAULT_TARGETSFILE_MODE = 0644
 
 func main() {
 	core.InitLogging()

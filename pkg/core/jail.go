@@ -2,12 +2,14 @@ package controller
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -32,6 +34,7 @@ type JailMeta struct {
 	Events     EventSubscription
 	Hash       string
 	Hints      map[string]string
+	SubnetId   string
 }
 
 type Jail struct {
@@ -41,13 +44,14 @@ type Jail struct {
 	Interface     *Epair
 	Zfs           *Zfs
 	IpAddr        netip.Addr
-	Mounts        []string
+	Mounts        []MountInfo
 	ExecUser      IdMap
 	UidMaps       map[string]IdMap
 	GidMaps       map[string]IdMap
 	Hash          string
 	Params        JailParams
 	Hints         map[string]string
+	SubnetId      string
 }
 
 type Epair struct {
@@ -83,6 +87,37 @@ type JailOptions struct {
 	IpAddr   netip.Addr
 	Hash     string
 	Hints    map[string]string
+	SubnetId string
+}
+
+type MountInfo struct {
+	Volume    string
+	ReadWrite bool
+}
+
+func umountRecursively(root string) error {
+	mntPrefix := strings.TrimSuffix(root, "/")
+	mounts, err := mountinfo.GetMounts(mountinfo.PrefixFilter(mntPrefix))
+	if err != nil {
+		return err
+	}
+
+	for _, mnt := range mounts {
+		if strings.TrimSuffix(mnt.Mountpoint, "/") == mntPrefix {
+			continue
+		}
+
+		log.Printf("umounting %v", mnt.Mountpoint)
+		_, _, umountErr := RunCmd(&CmdOptions{
+			Path: "/sbin/umount",
+			Args: []string{mnt.Mountpoint},
+		})
+		if umountErr != nil {
+			err = fmt.Errorf("%v: %v", err, umountErr)
+		}
+	}
+
+	return err
 }
 
 func EpairCreate() (*Epair, error) {
@@ -119,10 +154,18 @@ func ImportEpair(iface string) (*Epair, error) {
 }
 
 func (e *Epair) Delete() error {
-	_, _, err := RunCmd(&CmdOptions{
+	_, stderr, err := RunCmd(&CmdOptions{
 		Path: "/sbin/ifconfig",
 		Args: []string{e.Host, "destroy"},
 	})
+
+	if err != nil {
+		if bytes.Contains(stderr, []byte("does not exist")) {
+			return nil
+		}
+
+		return err
+	}
 
 	return err
 }
@@ -210,7 +253,7 @@ func JailImport(name string, zfs *Zfs, zfsMountpoint, zfsSet string) (*JailImpor
 		return nil, err
 	}
 
-	mounts := []string{}
+	mounts := []MountInfo{}
 	volumesPath := filepath.Join(zfsMountpoint, "volumes")
 	for _, mnt := range jailMounts {
 		if strings.TrimSuffix(mnt.Mountpoint, "/") == mntPrefix {
@@ -219,7 +262,12 @@ func JailImport(name string, zfs *Zfs, zfsMountpoint, zfsSet string) (*JailImpor
 
 		if strings.HasPrefix(mnt.Source, volumesPath) && mnt.FSType == "nullfs" {
 			vol := strings.TrimPrefix(mnt.Source, volumesPath+"/")
-			mounts = append(mounts, vol)
+			options := strings.Split(mnt.Options, ",")
+			rw := slices.Contains(options, "rw")
+			mounts = append(mounts, MountInfo{
+				Volume:    vol,
+				ReadWrite: rw,
+			})
 		}
 	}
 
@@ -237,6 +285,7 @@ func JailImport(name string, zfs *Zfs, zfsMountpoint, zfsSet string) (*JailImpor
 		Params:        jailMeta.JailParams,
 		Hash:          jailMeta.Hash,
 		Hints:         jailMeta.Hints,
+		SubnetId:      jailMeta.SubnetId,
 	}
 
 	return &JailImportResult{
@@ -371,6 +420,7 @@ func NewJail(options *JailOptions) (*Jail, error) {
 	}
 
 	zfsSource := options.ZfsSet + "/" + options.Manifest.Name
+	root := filepath.Join(options.Config.ZfsMountpoint, zfsSource)
 
 	log.Printf("creating jail %s", zfsSource)
 
@@ -382,6 +432,11 @@ func NewJail(options *JailOptions) (*Jail, error) {
 	err = options.Zfs.Clone(options.Manifest.Base+"@base", zfsSource, false)
 	if err != nil {
 		if os.IsExist(err) {
+			err = umountRecursively(root)
+			if err != nil {
+				return nil, err
+			}
+
 			err = options.Zfs.Destroy(zfsSource, false)
 			if err != nil {
 				return nil, err
@@ -431,8 +486,6 @@ func NewJail(options *JailOptions) (*Jail, error) {
 		return nil, fmt.Errorf("invalid jail hostname: %s", params["host.hostname"])
 	}
 
-	root := filepath.Join(options.Config.ZfsMountpoint, zfsSource)
-
 	params["name"] = jailName
 	params["vnet"] = ""
 	params["vnet.interface"] = epair.Jail
@@ -444,6 +497,8 @@ func NewJail(options *JailOptions) (*Jail, error) {
 		JailParams: params,
 		Events:     options.Manifest.EventSubscription,
 		Hash:       options.Hash,
+		Hints:      options.Hints,
+		SubnetId:   options.SubnetId,
 	}
 
 	metadata, err := json.Marshal(jailMeta)
@@ -454,10 +509,13 @@ func NewJail(options *JailOptions) (*Jail, error) {
 	// FIXME: check if meta can hold this, security.jail.meta_maxbufsize
 	params["meta"] = string(metadata)
 
-	mounts := []string{}
+	mounts := []MountInfo{}
 
 	for _, mnt := range options.Manifest.Mounts {
-		mounts = append(mounts, mnt.Volume)
+		mounts = append(mounts, MountInfo{
+			Volume:    mnt.Volume,
+			ReadWrite: mnt.ReadWrite,
+		})
 	}
 
 	return &Jail{
@@ -474,6 +532,7 @@ func NewJail(options *JailOptions) (*Jail, error) {
 		Params:        params,
 		Hash:          options.Hash,
 		Hints:         options.Hints,
+		SubnetId:      options.SubnetId,
 	}, nil
 }
 
@@ -492,9 +551,6 @@ func (j *Jail) Start() error {
 		}
 	}
 
-	// using CloseFds here because unfortunately if the running
-	// exec.start command holds the fds open, Go will keep trying
-	// to read from it until it's either closed or times out
 	_, _, err := RunCmd(&CmdOptions{
 		Path: "/usr/sbin/jail",
 		Args: paramStr,
@@ -517,11 +573,36 @@ func (j *Jail) Start() error {
 
 	err = j.initNetworking()
 	if err != nil {
-		defer j.Destroy()
+		shutdownErr := j.Shutdown()
+		destroyErr := j.Destroy()
 
-		sErr := j.Shutdown()
-		if sErr != nil {
-			return fmt.Errorf("%v: %v", err, sErr)
+		if shutdownErr != nil {
+			err = fmt.Errorf("%v: %v", err, shutdownErr)
+		}
+
+		if destroyErr != nil {
+			err = fmt.Errorf("%v: %v", err, destroyErr)
+		}
+
+		return err
+	}
+
+	return nil
+}
+
+func routeCtl(args []string, existOk bool) error {
+	_, stderr, err := RunCmd(&CmdOptions{
+		Path: "/sbin/route",
+		Args: args,
+	})
+
+	if err != nil {
+		if existOk && bytes.Contains(stderr, []byte("File exists")) {
+			return nil
+		}
+
+		if existOk && bytes.Contains(stderr, []byte("route has not been found")) {
+			return nil
 		}
 
 		return err
@@ -532,8 +613,21 @@ func (j *Jail) Start() error {
 
 func (j *Jail) initNetworking() error {
 	// jail side
-	jailCidr := j.IpAddr.String() + "/32"
 	_, _, err := RunCmd(&CmdOptions{
+		Path: "/sbin/ifconfig",
+		Args: []string{
+			"-j",
+			j.Name,
+			"lo0",
+			"inet",
+			"127.0.0.1/8"},
+	})
+	if err != nil {
+		return err
+	}
+
+	jailCidr := j.IpAddr.String() + "/32"
+	_, _, err = RunCmd(&CmdOptions{
 		Path: "/sbin/ifconfig",
 		Args: []string{
 			"-j",
@@ -545,22 +639,18 @@ func (j *Jail) initNetworking() error {
 		return err
 	}
 
-	_, _, err = RunCmd(&CmdOptions{
-		Path: "/sbin/route",
-		Args: []string{
-			"-j", j.Name,
-			"add",
-			"-net", DEFAULT_GATEWAY_IP_ADDR + "/32",
-			"-interface", j.Interface.Jail},
-	})
+	err = routeCtl([]string{
+		"-j", j.Name,
+		"add",
+		"-net", DEFAULT_GATEWAY_IP_ADDR + "/32",
+		"-interface", j.Interface.Jail},
+		true,
+	)
 	if err != nil {
 		return err
 	}
 
-	_, _, err = RunCmd(&CmdOptions{
-		Path: "/sbin/route",
-		Args: []string{"-j", j.Name, "add", "default", DEFAULT_GATEWAY_IP_ADDR},
-	})
+	err = routeCtl([]string{"-j", j.Name, "add", "default", DEFAULT_GATEWAY_IP_ADDR}, true)
 	if err != nil {
 		return err
 	}
@@ -574,12 +664,13 @@ func (j *Jail) initNetworking() error {
 		return err
 	}
 
-	_, _, err = RunCmd(&CmdOptions{
-		Path: "/sbin/route",
-		Args: []string{"add", "-net", jailCidr, "-interface", j.Interface.Host},
-	})
-
+	err = routeCtl([]string{"add", "-net", jailCidr, "-interface", j.Interface.Host}, true)
 	return err
+}
+
+func (j *Jail) teardownNetworking() error {
+	// host side
+	return routeCtl([]string{"del", "-net", j.IpAddr.String(), "-interface", j.Interface.Host}, true)
 }
 
 // TODO: tear down networking, but don't delete interface, move interface deletion to [`Destroy`]
@@ -604,30 +695,14 @@ func (j *Jail) Shutdown() error {
 		Timeout: stopTimeout + 10,
 	})
 
-	mntPrefix := strings.TrimSuffix(j.Root, "/")
-	mounts, mountsErr := mountinfo.GetMounts(mountinfo.PrefixFilter(mntPrefix))
-	if mountsErr != nil {
-		err = fmt.Errorf("%v: %v", err, mountsErr)
-	} else {
-		for _, mnt := range mounts {
-			if strings.TrimSuffix(mnt.Mountpoint, "/") == mntPrefix {
-				continue
-			}
-
-			log.Printf("shutdown: umounting %v", mnt.Mountpoint)
-			_, _, umountErr := RunCmd(&CmdOptions{
-				Path: "/sbin/umount",
-				Args: []string{mnt.Mountpoint},
-			})
-			if umountErr != nil {
-				err = fmt.Errorf("%v: %v", err, umountErr)
-			}
-		}
+	umountErr := umountRecursively(j.Root)
+	if umountErr != nil {
+		err = fmt.Errorf("%v: %v", err, umountErr)
 	}
 
-	epairErr := j.Interface.Delete()
-	if epairErr != nil {
-		err = fmt.Errorf("%v: %v", err, epairErr)
+	netErr := j.teardownNetworking()
+	if netErr != nil {
+		err = fmt.Errorf("%v: %v", err, netErr)
 	}
 
 	return err
@@ -636,6 +711,11 @@ func (j *Jail) Shutdown() error {
 func (j *Jail) Destroy() error {
 	log.Printf("destroying jail %s %s", j.Name, j.ZfsDatasource)
 	err := j.Zfs.Destroy(j.ZfsDatasource, true)
+
+	epairErr := j.Interface.Delete()
+	if epairErr != nil {
+		err = fmt.Errorf("%v: %v", err, epairErr)
+	}
 
 	return err
 }
@@ -779,14 +859,20 @@ func (j *Jail) Copy(src, dst, owner, group string, modeStr string) error {
 // caller should verify whether [`src`] is "trusted"
 // callee does verify whether [`dst`] are within jail bounds
 func (j *Jail) Mount(src, dst, owner, group, modeStr string, readWrite bool, dangerousAllowLinks bool) error {
-	uid, ok := j.UidMaps[owner]
-	if !ok {
-		return fmt.Errorf("unknown owner user %s in jail %s", owner, j.Name)
-	}
+	var ok bool
+	var uid IdMap
+	var gid IdMap
 
-	gid, ok := j.GidMaps[group]
-	if !ok {
-		return fmt.Errorf("unknown group %s in jail %s", group, j.Name)
+	if readWrite {
+		uid, ok = j.UidMaps[owner]
+		if !ok {
+			return fmt.Errorf("unknown owner user %s in jail %s", owner, j.Name)
+		}
+
+		gid, ok = j.GidMaps[group]
+		if !ok {
+			return fmt.Errorf("unknown group %s in jail %s", group, j.Name)
+		}
 	}
 
 	srcStat, err := os.Stat(src)
@@ -841,14 +927,16 @@ func (j *Jail) Mount(src, dst, owner, group, modeStr string, readWrite bool, dan
 		return err
 	}
 
-	err = os.Chmod(hostDestPath, os.FileMode(mode))
-	if err != nil {
-		return err
-	}
+	if readWrite {
+		err = os.Chmod(hostDestPath, os.FileMode(mode))
+		if err != nil {
+			return err
+		}
 
-	err = os.Chown(hostDestPath, uid.Id, gid.Id)
-	if err != nil {
-		return err
+		err = os.Chown(hostDestPath, uid.Id, gid.Id)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil
