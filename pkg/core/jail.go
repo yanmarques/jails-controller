@@ -21,6 +21,16 @@ const META_MARK = "0xdeadbeef"
 const DEFAULT_GATEWAY_IP_ADDR string = "10.138.1.1"
 const DEFAULT_STOP_TIMEOUT = 60
 
+var DEFAULT_ALLOWED_JAIL_PARAMS = []string{
+	"exec.clean",
+	"mount.devfs",
+	"exec.start",
+	"exec.stop",
+	"exec.jail_user",
+	"stop.timeout",
+	"host.hostname",
+}
+
 type IdMap struct {
 	Id   int
 	Name string
@@ -457,24 +467,19 @@ func NewJail(options *JailOptions) (*Jail, error) {
 		return nil, err
 	}
 
-	params, err := options.Manifest.Params.JailParams()
+	untrustedParams, err := options.Manifest.Params.JailParams()
 	if err != nil {
 		options.Zfs.Destroy(zfsSource, false)
 		return nil, err
 	}
 
-	var uids map[string]IdMap
-	var gids map[string]IdMap
-	var uidMap IdMap
-
-	err = parseIdentity(&uidMap, &uids, &gids, jailName, params, options.Config.ZfsMountpoint, zfsSource)
-	if err != nil {
-		options.Zfs.Destroy(zfsSource, false)
-		return nil, err
+	params := JailParams{}
+	for _, key := range options.Config.AllowedJailParams {
+		value, ok := untrustedParams[key]
+		if ok {
+			params[key] = value
+		}
 	}
-
-	// remove potentially harmful parameters
-	delete(params, "mount.fstab")
 
 	_, ok := params["host.hostname"]
 	if !ok {
@@ -491,6 +496,16 @@ func NewJail(options *JailOptions) (*Jail, error) {
 	params["vnet.interface"] = epair.Jail
 	params["path"] = root
 	params["exec.consolelog"] = filepath.Join(options.Config.LogDir, options.Manifest.Name+"_console.log")
+
+	var uids map[string]IdMap
+	var gids map[string]IdMap
+	var uidMap IdMap
+
+	err = parseIdentity(&uidMap, &uids, &gids, jailName, params, options.Config.ZfsMountpoint, zfsSource)
+	if err != nil {
+		options.Zfs.Destroy(zfsSource, false)
+		return nil, err
+	}
 
 	jailMeta := JailMeta{
 		Magic:      META_MARK,

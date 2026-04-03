@@ -96,8 +96,9 @@ type Config struct {
 
 	LogDir string
 
-	PrivateKeyPath string
-	Subnets        []Subnet
+	PrivateKeyPath    string
+	Subnets           []Subnet
+	AllowedJailParams []string
 }
 
 type State struct {
@@ -1473,6 +1474,9 @@ func NewReconcilerOrFail(configPath string) *Reconciler {
 	}
 
 	config.Directory = absPath
+	if len(config.AllowedJailParams) == 0 {
+		config.AllowedJailParams = DEFAULT_ALLOWED_JAIL_PARAMS
+	}
 
 	err = os.Mkdir(CONFIG_DIR, os.FileMode(0700))
 	if err != nil && !os.IsExist(err) {
