@@ -101,8 +101,12 @@ func (z *Zfs) Destroy(filesystem string, notExistsOk bool) error {
 			Args: []string{"destroy", z.ToDataset(filesystem)},
 		})
 		if err != nil {
-			if notExistsOk && bytes.Contains(stderr, []byte("dataset does not exist")) {
-				return nil
+			if bytes.Contains(stderr, []byte("dataset does not exist")) {
+				if notExistsOk {
+					return nil
+				}
+
+				return err
 
 			}
 
@@ -139,7 +143,7 @@ func (z *Zfs) ListFilesystems(root string) (map[string]*VolumeManifest, error) {
 			volName := strings.TrimPrefix(elements[0], rootSlash)
 			maxSize := elements[1]
 
-			quota, err := volumeSize(maxSize)
+			quota, err := VolumeSize(maxSize)
 			if err != nil {
 				return nil, err
 			}

@@ -2,7 +2,6 @@ package controller
 
 import (
 	"bytes"
-	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
@@ -14,14 +13,10 @@ import (
 	"io"
 	"log"
 	"net/netip"
-	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
-	"syscall"
 	"time"
 
 	git "github.com/go-git/go-git/v6"
@@ -37,6 +32,7 @@ const DEFAULT_IMAGE_CIDR = "10.100.0.0/16"
 const DEFAULT_JAIL_CIDR = "10.200.0.0/16"
 const DEFAULT_CMD_TIMEOUT_SMALL = 60
 const DEFAULT_CMD_TIMEOUT_LARGE = 600
+const DEFAULT_IPAM_TTL = 10080 // 7 days
 
 const PUBKEY_PATH_IN_JAIL = "/etc/jails-controller.pubkey"
 const CONFIG_DIR = "/usr/local/etc/jails-controller"
@@ -110,9 +106,10 @@ type State struct {
 }
 
 type DesiredState struct {
-	Jails   map[string]*Manifest
-	Images  map[string]*Manifest
-	Volumes map[string]*VolumeManifest
+	BaseManifests map[string]*Manifest
+	Jails         map[string]*Manifest
+	Images        map[string]*Manifest
+	Volumes       map[string]*VolumeManifest
 }
 
 type JailUserParams map[string]any
@@ -176,6 +173,7 @@ type Manifest struct {
 	Type              string
 	Name              string
 	Base              string
+	Include           string
 	Params            JailUserParams
 	EventSubscription EventSubscription
 	Actions           []JailAction
@@ -194,18 +192,6 @@ type VolumeManifest struct {
 
 	// metadata used internally
 	quota int
-}
-
-type IPSlot struct {
-	IP       netip.Addr
-	InUse    bool
-	Consumer string
-}
-
-type IPManager struct {
-	Slots    []IPSlot
-	Network  netip.Prefix
-	LastSlot int
 }
 
 type EventJailSync struct {
@@ -293,270 +279,6 @@ func (c JailUserParams) JailParams() (JailParams, error) {
 	return params, nil
 }
 
-func ValidHostname(hostname string) bool {
-	if hostname == "" {
-		return false
-	}
-
-	if strings.TrimSpace(hostname) == "" {
-		return false
-	}
-
-	if len(hostname) > 512 {
-		return false
-	}
-
-	parsedUrl, err := url.Parse("https://" + hostname + "/")
-	if err != nil {
-		return false
-	}
-
-	if parsedUrl.Host != hostname {
-		return false
-	}
-
-	if !((hostname[0] >= 'a' && hostname[0] <= 'z') ||
-		(hostname[0] >= 'A' && hostname[0] <= 'Z') ||
-		(hostname[0] >= '0' && hostname[0] <= '9')) {
-		return false
-	}
-
-	for _, char := range hostname {
-		if !((char >= 'a' && char <= 'z') ||
-			(char >= 'A' && char <= 'Z') ||
-			(char >= '0' && char <= '9') ||
-			char == '-') {
-			return false
-		}
-	}
-
-	return true
-}
-
-func RunCmd(options *CmdOptions) ([]byte, []byte, error) {
-	if options.Timeout <= 0 {
-		options.Timeout = DEFAULT_CMD_TIMEOUT_SMALL
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(options.Timeout)*time.Second)
-	defer cancel()
-
-	var stdout bytes.Buffer
-	var stderr bytes.Buffer
-
-	cmd := exec.CommandContext(ctx, options.Path, options.Args...)
-
-	cmd.SysProcAttr = &syscall.SysProcAttr{
-		Setpgid: true,
-	}
-
-	if options.CloseFds {
-		cmd.Stdin = nil
-		cmd.Stdout = nil
-		cmd.Stderr = nil
-	} else {
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
-		cmd.Stdin = options.Stdin
-	}
-
-	// this WaitDelay addresses a bug on Go command execution,
-	// maybe on FreeBSD only, when an open file descriptor is not
-	// closed by the callee process (identified here by [`options.Path`]),
-	// causing Go I/O coroutines to wait forever.
-	cmd.WaitDelay = time.Duration(DEFAULT_CMD_TIMEOUT_SMALL) * time.Second
-
-	err := cmd.Run()
-
-	stdoutB := stdout.Bytes()
-	stderrB := stderr.Bytes()
-
-	if ctx.Err() == context.DeadlineExceeded {
-		return stdoutB, stderrB, fmt.Errorf("command timed out: stdout=%s stderr=%s: %v %v",
-			strings.TrimSpace(string(stdoutB)), strings.TrimSpace(string(stderrB)),
-			options.Path, options.Args)
-	}
-
-	if err != nil {
-		return stdoutB, stderrB, fmt.Errorf("%v: stdout=%s stderr=%s: %v %v",
-			err, strings.TrimSpace(string(stdoutB)), strings.TrimSpace(string(stderrB)),
-			options.Path, options.Args)
-	}
-
-	return stdoutB, stderrB, nil
-}
-
-func jailListAll() (map[string]bool, error) {
-	out, _, err := RunCmd(&CmdOptions{
-		Path: "/usr/sbin/jls",
-		Args: []string{"name"},
-	})
-	if err != nil {
-		return nil, err
-	}
-
-	stdout := strings.TrimSpace(string(out))
-	jails := map[string]bool{}
-
-	for line := range strings.SplitSeq(stdout, "\n") {
-		if len(line) > 0 {
-			jails[line] = true
-		}
-	}
-
-	return jails, nil
-}
-
-func copyFile(src, dest string, perm os.FileMode) error {
-	srcFile, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer srcFile.Close()
-
-	destFile, err := os.Create(dest)
-	if err != nil {
-		return err
-	}
-	defer destFile.Close()
-
-	err = os.Chmod(dest, perm)
-	if err != nil {
-		return err
-	}
-
-	_, err = io.Copy(destFile, srcFile)
-	return err
-}
-
-func NewIPManager(prefix string) (*IPManager, error) {
-	network, err := netip.ParsePrefix(prefix)
-	if err != nil {
-		return nil, err
-	}
-
-	return &IPManager{
-		Slots:    []IPSlot{},
-		Network:  network,
-		LastSlot: 0,
-	}, nil
-}
-
-func (i *IPManager) AllocateIP(consumer string) (*netip.Addr, error) {
-	for idx := range i.Slots {
-		slot := &i.Slots[idx]
-		if slot.Consumer == consumer || !slot.InUse {
-			slot.InUse = true
-			slot.Consumer = consumer
-			return &slot.IP, nil
-		}
-	}
-
-	var addr netip.Addr
-	if len(i.Slots) == 0 {
-		addr = i.Network.Addr().Next()
-		i.LastSlot = 0
-	} else {
-		lastInSlot := i.Slots[i.LastSlot]
-		addr = lastInSlot.IP.Next()
-	}
-
-	if !i.Network.Contains(addr) {
-		return nil, fmt.Errorf("ipmanager: no more IPs available")
-	}
-
-	i.LastSlot = len(i.Slots)
-	i.Slots = append(i.Slots, IPSlot{
-		IP:       addr,
-		InUse:    true,
-		Consumer: consumer,
-	})
-
-	return &addr, nil
-}
-
-func (i *IPManager) Free(ipAddr netip.Addr) error {
-	for idx := range i.Slots {
-		slot := &i.Slots[idx]
-		if slot.IP == ipAddr {
-			slot.InUse = false
-			return nil
-		}
-	}
-
-	return fmt.Errorf("unknown IP address: %v", ipAddr)
-}
-
-func (i *IPManager) Reserve(consumer string, ipAddr netip.Addr) error {
-	if !i.Network.Contains(ipAddr) {
-		return fmt.Errorf("IP address %v is outside the network: %v", ipAddr.String(), i.Network.String())
-	}
-
-	for idx := range i.Slots {
-		slot := &i.Slots[idx]
-		if slot.IP == ipAddr {
-			if slot.Consumer != consumer {
-				return fmt.Errorf("ip address %s already reserved for: %s", ipAddr.String(), consumer)
-			}
-
-			i.Slots[idx].InUse = true
-			return nil
-		}
-	}
-
-	if len(i.Slots) > 0 {
-		lastInSlot := i.Slots[i.LastSlot]
-		if ipAddr.Compare(lastInSlot.IP) > 0 {
-			i.LastSlot = len(i.Slots)
-		}
-	}
-
-	i.Slots = append(i.Slots, IPSlot{
-		IP:       ipAddr,
-		InUse:    true,
-		Consumer: consumer,
-	})
-
-	return nil
-}
-
-func volumeSize(size string) (int, error) {
-	if size == "none" {
-		return -1, nil
-	}
-
-	idx := len(size)
-	if strings.HasSuffix(size, "G") {
-		idx--
-	}
-
-	log.Printf("volume size: %s", size[:idx])
-	n, err := strconv.Atoi(size[:idx])
-	if err != nil {
-		return 0, err
-	}
-
-	if n < 1 {
-		return 0, fmt.Errorf("volume size can not be lower than 1 GB")
-	}
-
-	return n, nil
-}
-
-func safePathJoin(base string, untrusted ...string) string {
-	base = filepath.Clean(base)
-	u := []string{base}
-	for _, p := range untrusted {
-		u = append(u, p)
-	}
-	path := filepath.Join(u...)
-	if !strings.HasPrefix(path, base) {
-		return ""
-	}
-
-	return path
-}
-
 func PrepareJailBeforeStart(jail *Jail, hostPath string, actions []JailAction, mounts []JailMount, config Config) error {
 	// TODO: check for volume existence prior to this
 	for _, mnt := range mounts {
@@ -642,29 +364,79 @@ func PrepareJailAfterStart(jail *Jail, hostPath string, actions []JailAction, mo
 
 func NewDesiredState() *DesiredState {
 	return &DesiredState{
-		Jails:   map[string]*Manifest{},
-		Images:  map[string]*Manifest{},
-		Volumes: map[string]*VolumeManifest{},
+		BaseManifests: map[string]*Manifest{},
+		Jails:         map[string]*Manifest{},
+		Images:        map[string]*Manifest{},
+		Volumes:       map[string]*VolumeManifest{},
 	}
 }
 
-func (d *DesiredState) addJail(path string, jail *Manifest) error {
-	if len(jail.Name) == 0 {
+func (m *Manifest) Merge(other *Manifest) {
+	if m.Params == nil {
+		m.Params = JailUserParams{}
+	}
+
+	if m.Hints == nil {
+		m.Hints = map[string]string{}
+	}
+
+	for key, value := range other.Params {
+		_, ok := m.Params[key]
+		if !ok {
+			m.Params[key] = value
+		}
+	}
+
+	for key, value := range other.Hints {
+		_, ok := m.Hints[key]
+		if !ok {
+			m.Hints[key] = value
+		}
+	}
+
+	for _, action := range other.Actions {
+		m.Actions = append(m.Actions, action)
+	}
+
+	for _, mount := range other.Mounts {
+		m.Mounts = append(m.Mounts, mount)
+	}
+
+	for _, rlimit := range other.Rlimits {
+		m.Rlimits = append(m.Rlimits, rlimit)
+	}
+
+	if m.EventSubscription.Empty() {
+		m.EventSubscription = other.EventSubscription
+	}
+
+	if m.Network.SubnetId == "" {
+		m.Network.SubnetId = other.Network.SubnetId
+	}
+
+	// why would anyone do this?
+	if m.Network.StaticIp == "" {
+		m.Network.StaticIp = other.Network.StaticIp
+	}
+}
+
+func (m *Manifest) ValidateJailManifest(path string) error {
+	if len(m.Name) == 0 {
 		oops.Err(fmt.Errorf(
-			"manifest with empty jail name, ignoring: %v",
+			"manifest with empty name, ignoring: %v",
 			path))
 		return nil
 	}
 
-	if jail.EventSubscription.ServerPort <= 0 && !jail.EventSubscription.Empty() {
-		return fmt.Errorf("invalid event port %d in jail manifest %s", jail.EventSubscription.ServerPort, jail.Name)
+	if m.EventSubscription.ServerPort <= 0 && !m.EventSubscription.Empty() {
+		return fmt.Errorf("invalid event port %d in jail manifest %s", m.EventSubscription.ServerPort, m.Name)
 	}
 
-	if !jail.EventSubscription.Empty() {
-		serverCertPath := safePathJoin(filepath.Dir(path), jail.EventSubscription.ServerCertPath)
+	if !m.EventSubscription.Empty() {
+		serverCertPath := safePathJoin(filepath.Dir(path), m.EventSubscription.ServerCertPath)
 		if serverCertPath == "" {
-			return fmt.Errorf("invalid server cert path %s: can not copy outside manifest jail: %s",
-				jail.EventSubscription.ServerCertPath, jail.Name)
+			return fmt.Errorf("invalid server cert path %s: can not copy outside m m: %s",
+				m.EventSubscription.ServerCertPath, m.Name)
 		}
 
 		content, err := os.ReadFile(serverCertPath)
@@ -678,39 +450,65 @@ func (d *DesiredState) addJail(path string, jail *Manifest) error {
 			return err
 		}
 
-		jail.EventSubscription.ServerFingerprint = hex.EncodeToString(fingerprint[:])
+		m.EventSubscription.ServerFingerprint = hex.EncodeToString(fingerprint[:])
 	}
 
-	for idx := range jail.Rlimits {
-		err := jail.Rlimits[idx].Validate()
+	for idx := range m.Rlimits {
+		err := m.Rlimits[idx].Validate()
 		if err != nil {
 			return err
 		}
 	}
 
-	if jail.Network.SubnetId == "" {
-		jail.Network.SubnetId = "jails"
+	if m.Network.SubnetId == "" {
+		m.Network.SubnetId = "jails"
 	}
 
-	if jail.Network.StaticIp != "" {
-		_, err := netip.ParseAddr(jail.Network.StaticIp)
+	if m.Network.StaticIp != "" {
+		_, err := netip.ParseAddr(m.Network.StaticIp)
 		if err != nil {
-			return fmt.Errorf("invalid static ip %s in jail manifest %s", jail.Network.StaticIp, jail.Name)
+			return fmt.Errorf("invalid static ip %s in jail manifest %s", m.Network.StaticIp, m.Name)
 		}
 	}
 
-	for idx, action := range jail.Actions {
+	for idx, action := range m.Actions {
 		if action.BeforeStart {
 			continue
 		}
 
 		// jail actions after start are useless
-		jail.Actions[idx].BeforeStart = true
+		m.Actions[idx].BeforeStart = true
+	}
+
+	return nil
+}
+
+func (d *DesiredState) addBaseManifest(path string, manifest *Manifest) error {
+	err := manifest.ValidateJailManifest(path)
+	if err != nil {
+		return err
+	}
+
+	_, ok := d.BaseManifests[manifest.Name]
+	if ok {
+		return fmt.Errorf("duplicate base name definitions: %s", manifest.Name)
+	}
+
+	manifest.originalHostPath = filepath.Dir(path)
+	d.BaseManifests[manifest.Name] = manifest
+
+	return nil
+}
+
+func (d *DesiredState) addJail(path string, jail *Manifest) error {
+	err := jail.ValidateJailManifest(path)
+	if err != nil {
+		return err
 	}
 
 	_, ok := d.Jails[jail.Name]
 	if ok {
-		return fmt.Errorf("duplicate jail name definitions: %s, aborting", jail.Name)
+		return fmt.Errorf("duplicate jail name definitions: %s", jail.Name)
 	}
 
 	jail.originalHostPath = filepath.Dir(path)
@@ -764,7 +562,7 @@ func (d *DesiredState) addVolume(path string, vol *VolumeManifest) error {
 		return fmt.Errorf("duplicate volume name definitions: %s", vol.Name)
 	}
 
-	quota, err := volumeSize(vol.MaxSize)
+	quota, err := VolumeSize(vol.MaxSize)
 	if err != nil {
 		return fmt.Errorf("invalid volume maxSize %s at %s: %v", vol.MaxSize, path, err)
 	}
@@ -787,6 +585,8 @@ func (r *Reconciler) decodeFile(path string, content []byte, desiredState *Desir
 			return desiredState.addImage(path, &manifest)
 		case "jail":
 			return desiredState.addJail(path, &manifest)
+		case "base":
+			return desiredState.addBaseManifest(path, &manifest)
 		default:
 			return fmt.Errorf("invalid manifest at %s of type %s, only jail or image is supported", path, manifest.Type)
 		}
@@ -951,6 +751,20 @@ func (r *Reconciler) Reconcile() {
 			}
 
 		}
+	}
+
+	for _, manifest := range desiredState.Jails {
+		if manifest.Include == "" {
+			continue
+		}
+
+		baseManifest, ok := desiredState.BaseManifests[manifest.Include]
+		if !ok {
+			log.Printf("jail %s includes %s, but that base does not exist", manifest.Name, manifest.Include)
+			continue
+		}
+
+		manifest.Merge(baseManifest)
 	}
 
 	// order of creation: images, volumes, jails
@@ -1532,7 +1346,7 @@ func NewReconcilerOrFail(configPath string) *Reconciler {
 	ipam := map[string]*IPManager{}
 
 	for _, subnet := range config.Subnets {
-		manager, err := NewIPManager(subnet.Cidr)
+		manager, err := NewIPManager(subnet.Cidr, DEFAULT_IPAM_TTL*time.Minute)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -1542,7 +1356,7 @@ func NewReconcilerOrFail(configPath string) *Reconciler {
 
 	_, ok := ipam["jails"]
 	if !ok {
-		ipam["jails"], err = NewIPManager(DEFAULT_JAIL_CIDR)
+		ipam["jails"], err = NewIPManager(DEFAULT_JAIL_CIDR, DEFAULT_IPAM_TTL*time.Minute)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -1550,7 +1364,7 @@ func NewReconcilerOrFail(configPath string) *Reconciler {
 
 	_, ok = ipam["images"]
 	if !ok {
-		ipam["images"], err = NewIPManager(DEFAULT_IMAGE_CIDR)
+		ipam["images"], err = NewIPManager(DEFAULT_IMAGE_CIDR, DEFAULT_IPAM_TTL*time.Minute)
 		if err != nil {
 			log.Fatal(err)
 		}
@@ -1681,7 +1495,7 @@ func NewReconcilerOrFail(configPath string) *Reconciler {
 	}
 
 	state := NewState()
-	existingJails, err := jailListAll()
+	existingJails, err := JailListAll()
 	if err != nil {
 		log.Fatal(err)
 	}

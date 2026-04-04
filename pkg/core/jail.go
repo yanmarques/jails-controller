@@ -105,6 +105,27 @@ type MountInfo struct {
 	ReadWrite bool
 }
 
+func JailListAll() (map[string]bool, error) {
+	out, _, err := RunCmd(&CmdOptions{
+		Path: "/usr/sbin/jls",
+		Args: []string{"name"},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	stdout := strings.TrimSpace(string(out))
+	jails := map[string]bool{}
+
+	for line := range strings.SplitSeq(stdout, "\n") {
+		if len(line) > 0 {
+			jails[line] = true
+		}
+	}
+
+	return jails, nil
+}
+
 func umountRecursively(root string) error {
 	mntPrefix := strings.TrimSuffix(root, "/")
 	mounts, err := mountinfo.GetMounts(mountinfo.PrefixFilter(mntPrefix))
