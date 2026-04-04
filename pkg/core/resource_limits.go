@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bytes"
 	"fmt"
 	"log"
 	"slices"
@@ -159,17 +160,28 @@ func (r *JailResourceManager) Import() error {
 	return nil
 }
 
+func (r *JailResourceManager) destroy(rule string) error {
+	_, stderr, err := RunCmd(&CmdOptions{
+		Path: "/usr/bin/rctl",
+		Args: []string{"-r", rule},
+	})
+
+	if err != nil && !bytes.Contains(stderr, []byte("No such process")) {
+		return err
+	}
+
+	return nil
+}
+
 func (r *JailResourceManager) DestroyAll(jail string) error {
 	for rule := range r.Limits[jail] {
 		log.Printf("destroying rctl rule %s", rule)
-		_, _, err := RunCmd(&CmdOptions{
-			Path: "/usr/bin/rctl",
-			Args: []string{"-r", rule},
-		})
-
+		err := r.destroy(rule)
 		if err != nil {
 			return err
 		}
+
+		delete(r.Limits[jail], rule)
 	}
 
 	return nil
@@ -197,11 +209,7 @@ func (r *JailResourceManager) Add(jail string, limits []ResourceLimit) error {
 	}
 
 	for _, rule := range toDestroy {
-		_, _, err := RunCmd(&CmdOptions{
-			Path: "/usr/bin/rctl",
-			Args: []string{"-r", rule},
-		})
-
+		err := r.destroy(rule)
 		if err != nil {
 			return err
 		}

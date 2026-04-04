@@ -605,7 +605,28 @@ func (j *Jail) Start() error {
 	return nil
 }
 
-func routeCtl(args []string, existOk bool) error {
+func routeDel(args []string, notExistOk bool) error {
+	_, stderr, err := RunCmd(&CmdOptions{
+		Path: "/sbin/route",
+		Args: args,
+	})
+
+	if err != nil {
+		if notExistOk && bytes.Contains(stderr, []byte("route has not been found")) {
+			return nil
+		}
+
+		if notExistOk && bytes.Contains(stderr, []byte("does not exist")) {
+			return nil
+		}
+
+		return err
+	}
+
+	return nil
+}
+
+func routeAdd(args []string, existOk bool) error {
 	_, stderr, err := RunCmd(&CmdOptions{
 		Path: "/sbin/route",
 		Args: args,
@@ -613,10 +634,6 @@ func routeCtl(args []string, existOk bool) error {
 
 	if err != nil {
 		if existOk && bytes.Contains(stderr, []byte("File exists")) {
-			return nil
-		}
-
-		if existOk && bytes.Contains(stderr, []byte("route has not been found")) {
 			return nil
 		}
 
@@ -654,7 +671,7 @@ func (j *Jail) initNetworking() error {
 		return err
 	}
 
-	err = routeCtl([]string{
+	err = routeAdd([]string{
 		"-j", j.Name,
 		"add",
 		"-net", DEFAULT_GATEWAY_IP_ADDR + "/32",
@@ -665,7 +682,7 @@ func (j *Jail) initNetworking() error {
 		return err
 	}
 
-	err = routeCtl([]string{"-j", j.Name, "add", "default", DEFAULT_GATEWAY_IP_ADDR}, true)
+	err = routeAdd([]string{"-j", j.Name, "add", "default", DEFAULT_GATEWAY_IP_ADDR}, true)
 	if err != nil {
 		return err
 	}
@@ -679,13 +696,13 @@ func (j *Jail) initNetworking() error {
 		return err
 	}
 
-	err = routeCtl([]string{"add", "-net", jailCidr, "-interface", j.Interface.Host}, true)
+	err = routeAdd([]string{"add", "-net", jailCidr, "-interface", j.Interface.Host}, true)
 	return err
 }
 
 func (j *Jail) teardownNetworking() error {
 	// host side
-	return routeCtl([]string{"del", "-net", j.IpAddr.String(), "-interface", j.Interface.Host}, true)
+	return routeDel([]string{"del", "-net", j.IpAddr.String(), "-interface", j.Interface.Host}, true)
 }
 
 // TODO: tear down networking, but don't delete interface, move interface deletion to [`Destroy`]
@@ -704,11 +721,14 @@ func (j *Jail) Shutdown() error {
 		}
 	}
 
-	_, _, err := RunCmd(&CmdOptions{
+	_, stderr, err := RunCmd(&CmdOptions{
 		Path:    "/usr/sbin/jail",
 		Args:    []string{"-r", j.Name},
 		Timeout: stopTimeout + 10,
 	})
+	if err != nil && bytes.Contains(stderr, []byte("not found")) {
+		err = nil
+	}
 
 	umountErr := umountRecursively(j.Root)
 	if umountErr != nil {

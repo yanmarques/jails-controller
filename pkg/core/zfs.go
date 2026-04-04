@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"time"
 )
 
 type Zfs struct {
@@ -83,24 +84,38 @@ func (z *Zfs) CreateSnapshot(dataset, snapName string, existOk bool) error {
 	return nil
 }
 
+// Try to destroy the filesystem, with automatic retry.
+// It will retry up to 10 seconds to destroy.
 func (z *Zfs) Destroy(filesystem string, notExistsOk bool) error {
-	_, stderr, err := RunCmd(&CmdOptions{
-		Path: "/sbin/zfs",
-		Args: []string{"destroy", z.ToDataset(filesystem)},
-	})
-	if err != nil {
-		if bytes.Contains(stderr, []byte("dataset does not exist")) {
-			if notExistsOk {
-				return nil
-			}
+	var retries int
+	var err error
+	var stderr []byte
 
+	for {
+		if retries >= 20 {
 			return err
 		}
 
-		return err
-	}
+		_, stderr, err = RunCmd(&CmdOptions{
+			Path: "/sbin/zfs",
+			Args: []string{"destroy", z.ToDataset(filesystem)},
+		})
+		if err != nil {
+			if notExistsOk && bytes.Contains(stderr, []byte("dataset does not exist")) {
+				return nil
 
-	return nil
+			}
+
+			if !bytes.Contains(stderr, []byte("pool or dataset is busy")) {
+				return err
+			}
+		} else {
+			return nil
+		}
+
+		retries++
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 func (z *Zfs) ListFilesystems(root string) (map[string]*VolumeManifest, error) {

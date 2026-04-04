@@ -1054,6 +1054,8 @@ func (r *Reconciler) Reconcile() {
 			continue
 		}
 
+		log.Printf("destroying jail %s", jail.Name)
+
 		oops.Err(ipam.Free(jail.IpAddr))
 		hasErr := false
 
@@ -1089,6 +1091,7 @@ func (r *Reconciler) Reconcile() {
 
 	// destroy images
 	for _, image := range imagestoDestroy {
+		log.Printf("destroying image %s", image)
 		err = oops.Err(r.Zfs.Destroy("images/"+image+"@base", true))
 		if err != nil {
 			continue
