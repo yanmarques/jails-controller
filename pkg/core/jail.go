@@ -31,6 +31,12 @@ var DEFAULT_ALLOWED_JAIL_PARAMS = []string{
 	"host.hostname",
 }
 
+var DEFAULT_JAIL_PARAMS = JailParams{
+	"exec.clean":  "",
+	"mount.devfs": "",
+	"securelevel": "2",
+}
+
 type IdMap struct {
 	Id   int
 	Name string
@@ -502,6 +508,13 @@ func NewJail(options *JailOptions) (*Jail, error) {
 		}
 	}
 
+	for key, value := range options.Config.DefaultJailParams {
+		_, ok := params[key]
+		if !ok {
+			params[key] = value
+		}
+	}
+
 	_, ok := params["host.hostname"]
 	if !ok {
 		params["host.hostname"] = jailName
@@ -516,7 +529,7 @@ func NewJail(options *JailOptions) (*Jail, error) {
 	params["vnet"] = ""
 	params["vnet.interface"] = epair.Jail
 	params["path"] = root
-	params["exec.consolelog"] = filepath.Join(options.Config.LogDir, options.Manifest.Name+"_console.log")
+	params["exec.consolelog"] = filepath.Join(options.Config.LogDir, options.Manifest.Name+".log")
 
 	var uids map[string]IdMap
 	var gids map[string]IdMap
@@ -726,8 +739,6 @@ func (j *Jail) teardownNetworking() error {
 	return routeDel([]string{"del", "-net", j.IpAddr.String(), "-interface", j.Interface.Host}, true)
 }
 
-// TODO: tear down networking, but don't delete interface, move interface deletion to [`Destroy`]
-// TODO: handle persistent jails
 func (j *Jail) Shutdown() error {
 	stopTimeout := DEFAULT_STOP_TIMEOUT
 

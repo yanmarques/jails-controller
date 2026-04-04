@@ -34,6 +34,7 @@ const DEFAULT_CMD_TIMEOUT_SMALL = 60
 const DEFAULT_CMD_TIMEOUT_LARGE = 600
 const DEFAULT_IPAM_TTL = 10080 // 7 days
 
+const SPECIAL_LOGS_VOLUME = ":logs:"
 const PUBKEY_PATH_IN_JAIL = "/etc/jails-controller.pubkey"
 const CONFIG_DIR = "/usr/local/etc/jails-controller"
 const PRIVKEY_PATH = CONFIG_DIR + "/controller.key"
@@ -92,9 +93,12 @@ type Config struct {
 
 	LogDir string
 
-	PrivateKeyPath    string
-	Subnets           []Subnet
+	PrivateKeyPath string
+	Subnets        []Subnet
+	// Whitelist of jail params that any jail can use
 	AllowedJailParams []string
+	// Params applied to all jails by default, but overridable
+	DefaultJailParams JailParams
 }
 
 type State struct {
@@ -280,14 +284,24 @@ func (c JailUserParams) JailParams() (JailParams, error) {
 }
 
 func PrepareJailBeforeStart(jail *Jail, hostPath string, actions []JailAction, mounts []JailMount, config Config) error {
+	var err error
 	// TODO: check for volume existence prior to this
 	for _, mnt := range mounts {
+		if mnt.Volume == SPECIAL_LOGS_VOLUME {
+			err = jail.Mount(config.LogDir, mnt.Dest, "", "", "755", false, true)
+			if err != nil {
+				return err
+			}
+
+			continue
+		}
+
 		src := safePathJoin(config.ZfsMountpoint, "volumes", mnt.Volume)
 		if len(src) == 0 {
 			return fmt.Errorf("invalid mount src path: can not mount outside jail path: %s", mnt.Volume)
 		}
 
-		err := jail.Mount(src, mnt.Dest, mnt.Owner, mnt.Group, mnt.Mode, mnt.ReadWrite, true)
+		err = jail.Mount(src, mnt.Dest, mnt.Owner, mnt.Group, mnt.Mode, mnt.ReadWrite, true)
 		if err != nil {
 			return err
 		}
@@ -307,7 +321,7 @@ func PrepareJailBeforeStart(jail *Jail, hostPath string, actions []JailAction, m
 				return fmt.Errorf("invalid copy src path: can not copy outside manifest path: %s", action.Src)
 			}
 
-			err := jail.Copy(path, action.Dest, action.Owner, action.Group, action.Mode)
+			err = jail.Copy(path, action.Dest, action.Owner, action.Group, action.Mode)
 			if err != nil {
 				return err
 			}
@@ -421,11 +435,10 @@ func (m *Manifest) Merge(other *Manifest) {
 }
 
 func (m *Manifest) ValidateJailManifest(path string) error {
-	if len(m.Name) == 0 {
-		oops.Err(fmt.Errorf(
+	if m.Name == "" {
+		return fmt.Errorf(
 			"manifest with empty name, ignoring: %v",
-			path))
-		return nil
+			path)
 	}
 
 	if m.EventSubscription.ServerPort <= 0 && !m.EventSubscription.Empty() {
@@ -545,10 +558,16 @@ func (d *DesiredState) addImage(path string, image *Manifest) error {
 }
 
 func (d *DesiredState) addVolume(path string, vol *VolumeManifest) error {
-	if len(vol.Name) == 0 {
+	if vol.Name == "" {
 		return fmt.Errorf(
 			"volume with empty name: %v",
 			path)
+	}
+
+	if vol.Name == SPECIAL_LOGS_VOLUME {
+		return fmt.Errorf(
+			"volume name %s is reserved",
+			vol.Name)
 	}
 
 	if len(vol.MaxSize) == 0 {
@@ -1293,6 +1312,10 @@ func NewReconcilerOrFail(configPath string) *Reconciler {
 	config.Directory = absPath
 	if len(config.AllowedJailParams) == 0 {
 		config.AllowedJailParams = DEFAULT_ALLOWED_JAIL_PARAMS
+	}
+
+	if config.DefaultJailParams == nil {
+		config.DefaultJailParams = DEFAULT_JAIL_PARAMS
 	}
 
 	err = os.Mkdir(CONFIG_DIR, os.FileMode(0700))
