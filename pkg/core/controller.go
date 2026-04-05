@@ -17,6 +17,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"text/template"
 	"time"
 
 	git "github.com/go-git/go-git/v6"
@@ -34,11 +35,13 @@ const DEFAULT_CMD_TIMEOUT_SMALL = 60
 const DEFAULT_CMD_TIMEOUT_LARGE = 600
 const DEFAULT_IPAM_TTL = 10080 // 7 days
 
-const SPECIAL_LOGS_VOLUME = ":logs:"
+const RESERVED_LOGS_VOLUME = ":logs:"
+const RESERVED_ROOT_CA_SECRET = ":rootCA:"
 const PUBKEY_PATH_IN_JAIL = "/etc/jails-controller.pubkey"
 const CONFIG_DIR = "/usr/local/etc/jails-controller"
 const PRIVKEY_PATH = CONFIG_DIR + "/controller.key"
 const PUBKEY_PATH = CONFIG_DIR + "/controller.pubkey"
+const SECRETS_FILE = CONFIG_DIR + "/private_secrets.json"
 
 var oops *ErrAggregator
 
@@ -50,6 +53,7 @@ type Reconciler struct {
 	Zfs      *Zfs
 	Notifier *LazyEventNotifier
 	Rctl     *JailResourceManager
+	Scm      *SecretManager
 	Keypair  Keypair
 	FirstRun bool
 }
@@ -106,6 +110,7 @@ type State struct {
 	Images      map[string]string
 	Jails       map[string]*Jail
 	Volumes     map[string]*VolumeManifest
+	Secrets     map[string]map[string]*SecretManifest
 	Subscribers map[string]Subscriber
 }
 
@@ -114,6 +119,7 @@ type DesiredState struct {
 	Jails         map[string]*Manifest
 	Images        map[string]*Manifest
 	Volumes       map[string]*VolumeManifest
+	Secrets       map[string]map[string]*SecretManifest
 }
 
 type JailUserParams map[string]any
@@ -126,11 +132,13 @@ type JailAction struct {
 	CommandTimeout int
 	Args           []string
 	// Copy action
-	Src   string
-	Dest  string
-	Owner string
-	Group string
-	Mode  string
+	Secret     string
+	SecretType string
+	Src        string
+	Dest       string
+	Owner      string
+	Group      string
+	Mode       string
 }
 
 type JailMount struct {
@@ -143,13 +151,14 @@ type JailMount struct {
 }
 
 type EventSubscription struct {
+	ServerCertSecret  string
 	ServerCertPath    string
 	ServerPort        int
 	ServerFingerprint string
 }
 
 func (e EventSubscription) Empty() bool {
-	return e.ServerPort == 0 && e.ServerCertPath == ""
+	return e.ServerPort == 0 && (e.ServerCertPath == "" || e.ServerCertSecret == "")
 }
 
 type Subscriber struct {
@@ -198,6 +207,16 @@ type VolumeManifest struct {
 	quota int
 }
 
+type SecretManifest struct {
+	Name         string
+	SecretType   string
+	Length       int64
+	ExcludeChars bool
+	SpecialChars string
+	Bits         int
+	DNSNames     []string
+}
+
 type EventJailSync struct {
 	Name     string
 	Hostname string
@@ -237,13 +256,20 @@ func (m *Manifest) Hash() (string, error) {
 }
 
 func NewState() *State {
-	return &State{
+	s := &State{
 		Jails:       map[string]*Jail{},
 		Images:      map[string]string{},
 		Volumes:     map[string]*VolumeManifest{},
+		Secrets:     map[string]map[string]*SecretManifest{},
 		Subscribers: map[string]Subscriber{},
 		LastTag:     "",
 	}
+
+	s.Secrets[SECRET_TYPE_PASSWORD] = map[string]*SecretManifest{}
+	s.Secrets[SECRET_TYPE_TOKEN] = map[string]*SecretManifest{}
+	s.Secrets[SECRET_TYPE_TLS_CERT] = map[string]*SecretManifest{}
+
+	return s
 }
 
 func NewErrAggregator() *ErrAggregator {
@@ -283,12 +309,12 @@ func (c JailUserParams) JailParams() (JailParams, error) {
 	return params, nil
 }
 
-func PrepareJailBeforeStart(jail *Jail, hostPath string, actions []JailAction, mounts []JailMount, config Config) error {
+func (r *Reconciler) PrepareJailBeforeStart(jail *Jail, hostPath string, actions []JailAction, mounts []JailMount) error {
 	var err error
 	// TODO: check for volume existence prior to this
 	for _, mnt := range mounts {
-		if mnt.Volume == SPECIAL_LOGS_VOLUME {
-			err = jail.Mount(config.LogDir, mnt.Dest, "", "", "755", false, true)
+		if mnt.Volume == RESERVED_LOGS_VOLUME {
+			err = jail.Mount(r.Config.LogDir, mnt.Dest, "", "", "755", false, true)
 			if err != nil {
 				return err
 			}
@@ -296,7 +322,7 @@ func PrepareJailBeforeStart(jail *Jail, hostPath string, actions []JailAction, m
 			continue
 		}
 
-		src := safePathJoin(config.ZfsMountpoint, "volumes", mnt.Volume)
+		src := safePathJoin(r.Config.ZfsMountpoint, "volumes", mnt.Volume)
 		if len(src) == 0 {
 			return fmt.Errorf("invalid mount src path: can not mount outside jail path: %s", mnt.Volume)
 		}
@@ -316,12 +342,16 @@ func PrepareJailBeforeStart(jail *Jail, hostPath string, actions []JailAction, m
 				continue
 			}
 
-			path := safePathJoin(hostPath, action.Src)
-			if len(path) == 0 {
-				return fmt.Errorf("invalid copy src path: can not copy outside manifest path: %s", action.Src)
+			err := r.CopyToJail(hostPath, jail, &action)
+			if err != nil {
+				return err
+			}
+		case "template":
+			if !action.BeforeStart {
+				continue
 			}
 
-			err = jail.Copy(path, action.Dest, action.Owner, action.Group, action.Mode)
+			err := r.TemplateToJail(hostPath, jail, &action)
 			if err != nil {
 				return err
 			}
@@ -337,7 +367,7 @@ func PrepareJailBeforeStart(jail *Jail, hostPath string, actions []JailAction, m
 	return nil
 }
 
-func PrepareJailAfterStart(jail *Jail, hostPath string, actions []JailAction, mounts []JailMount, config Config) error {
+func (r *Reconciler) PrepareJailAfterStart(jail *Jail, hostPath string, actions []JailAction, mounts []JailMount) error {
 	for _, action := range actions {
 		switch action.Type {
 		case "exec":
@@ -355,12 +385,16 @@ func PrepareJailAfterStart(jail *Jail, hostPath string, actions []JailAction, mo
 				continue
 			}
 
-			path := safePathJoin(hostPath, action.Src)
-			if len(path) == 0 {
-				return fmt.Errorf("invalid copy src path: can not copy outside manifest path: %s", action.Src)
+			err := r.CopyToJail(hostPath, jail, &action)
+			if err != nil {
+				return err
+			}
+		case "template":
+			if action.BeforeStart {
+				continue
 			}
 
-			err := jail.Copy(path, action.Dest, action.Owner, action.Group, action.Mode)
+			err := r.TemplateToJail(hostPath, jail, &action)
 			if err != nil {
 				return err
 			}
@@ -376,13 +410,81 @@ func PrepareJailAfterStart(jail *Jail, hostPath string, actions []JailAction, mo
 	return nil
 }
 
+func (r *Reconciler) TemplateToJail(hostPath string, jail *Jail, action *JailAction) error {
+	template := template.New("jail action")
+
+	path := safePathJoin(hostPath, action.Src)
+	if len(path) == 0 {
+		return fmt.Errorf("invalid copy src path: can not copy outside manifest path: %s", action.Src)
+	}
+
+	content, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	tmpl, err := template.Parse(string(content))
+	if err != nil {
+		return err
+	}
+
+	var buffer bytes.Buffer
+	err = tmpl.Execute(&buffer, r.Scm.Inner)
+	if err != nil {
+		return err
+	}
+
+	return jail.CopyContent(buffer.Bytes(), action.Dest, action.Owner, action.Group, action.Mode)
+}
+
+func (r *Reconciler) CopyToJail(hostPath string, jail *Jail, action *JailAction) error {
+	if action.Secret != "" && action.Src != "" {
+		return fmt.Errorf("action src and secret defined, specify one not both, src=%s and secret=%s",
+			action.Src, action.Secret)
+	}
+
+	if action.Secret != "" {
+		if action.Secret == RESERVED_ROOT_CA_SECRET {
+			return jail.CopyContent(r.Scm.Inner.RootCA.Cert, action.Dest,
+				action.Owner, action.Group, action.Mode)
+		}
+
+		if action.SecretType == "" {
+			return fmt.Errorf("action copy secret %s for jail %s is missing the secretType",
+				action.Secret, jail.Name)
+		}
+
+		content, ok := r.Scm.Content(action.SecretType, action.Secret)
+		if !ok {
+			return fmt.Errorf("copy jail %s: unknown secret %s of type %s",
+				jail.Name, action.Secret, action.SecretType)
+		}
+
+		return jail.CopyContent([]byte(content), action.Dest, action.Owner, action.Group, action.Mode)
+	}
+
+	path := safePathJoin(hostPath, action.Src)
+	if len(path) == 0 {
+		return fmt.Errorf("invalid copy src path: can not copy outside manifest path: %s", action.Src)
+	}
+
+	return jail.Copy(path, action.Dest, action.Owner, action.Group, action.Mode)
+}
+
 func NewDesiredState() *DesiredState {
-	return &DesiredState{
+	d := &DesiredState{
 		BaseManifests: map[string]*Manifest{},
 		Jails:         map[string]*Manifest{},
 		Images:        map[string]*Manifest{},
 		Volumes:       map[string]*VolumeManifest{},
+		Secrets:       map[string]map[string]*SecretManifest{},
 	}
+
+	d.Secrets[SECRET_TYPE_PASSWORD] = map[string]*SecretManifest{}
+	d.Secrets[SECRET_TYPE_TOKEN] = map[string]*SecretManifest{}
+	d.Secrets[SECRET_TYPE_TLS_CERT] = map[string]*SecretManifest{}
+
+	return d
 }
 
 func (m *Manifest) Merge(other *Manifest) {
@@ -434,6 +536,55 @@ func (m *Manifest) Merge(other *Manifest) {
 	}
 }
 
+func (m *Manifest) ApplyMetadata(scm *SecretManager) error {
+	if !m.EventSubscription.Empty() {
+		if m.EventSubscription.ServerCertPath != "" && m.EventSubscription.ServerCertSecret != "" {
+			return fmt.Errorf("event subscription in manifest %s contains both serverCertPath and serverCertSecret", m.Name)
+		}
+
+		var content []byte
+		var ok bool
+		var err error
+
+		if m.EventSubscription.ServerCertPath != "" {
+			serverCertPath := safePathJoin(filepath.Dir(m.originalHostPath), m.EventSubscription.ServerCertPath)
+			if serverCertPath == "" {
+				return fmt.Errorf("invalid server cert path %s: can not copy outside m m: %s",
+					m.EventSubscription.ServerCertPath, m.Name)
+			}
+
+			content, err = os.ReadFile(serverCertPath)
+			if err != nil {
+				return err
+			}
+		} else {
+			content, ok = scm.Content(SECRET_TYPE_TLS_CERT, m.EventSubscription.ServerCertSecret)
+			if !ok {
+				return fmt.Errorf("event subscription: unknown serverCertSecret %s", m.EventSubscription.ServerCertSecret)
+			}
+		}
+
+		pemDecoded, _ := pem.Decode(content)
+		fingerprint, err := sumFingerprint(pemDecoded.Bytes)
+		if err != nil {
+			return err
+		}
+
+		m.EventSubscription.ServerFingerprint = hex.EncodeToString(fingerprint[:])
+	}
+
+	for idx, action := range m.Actions {
+		if action.BeforeStart {
+			continue
+		}
+
+		// jail actions after start are useless
+		m.Actions[idx].BeforeStart = true
+	}
+
+	return nil
+}
+
 func (m *Manifest) ValidateJailManifest(path string) error {
 	if m.Name == "" {
 		return fmt.Errorf(
@@ -446,24 +597,9 @@ func (m *Manifest) ValidateJailManifest(path string) error {
 	}
 
 	if !m.EventSubscription.Empty() {
-		serverCertPath := safePathJoin(filepath.Dir(path), m.EventSubscription.ServerCertPath)
-		if serverCertPath == "" {
-			return fmt.Errorf("invalid server cert path %s: can not copy outside m m: %s",
-				m.EventSubscription.ServerCertPath, m.Name)
+		if m.EventSubscription.ServerCertPath != "" && m.EventSubscription.ServerCertSecret != "" {
+			return fmt.Errorf("event subscription in manifest %s contains both serverCertPath and serverCertSecret", m.Name)
 		}
-
-		content, err := os.ReadFile(serverCertPath)
-		if err != nil {
-			return err
-		}
-
-		pemDecoded, _ := pem.Decode(content)
-		fingerprint, err := sumFingerprint(pemDecoded.Bytes)
-		if err != nil {
-			return err
-		}
-
-		m.EventSubscription.ServerFingerprint = hex.EncodeToString(fingerprint[:])
 	}
 
 	for idx := range m.Rlimits {
@@ -482,15 +618,6 @@ func (m *Manifest) ValidateJailManifest(path string) error {
 		if err != nil {
 			return fmt.Errorf("invalid static ip %s in jail manifest %s", m.Network.StaticIp, m.Name)
 		}
-	}
-
-	for idx, action := range m.Actions {
-		if action.BeforeStart {
-			continue
-		}
-
-		// jail actions after start are useless
-		m.Actions[idx].BeforeStart = true
 	}
 
 	return nil
@@ -564,7 +691,7 @@ func (d *DesiredState) addVolume(path string, vol *VolumeManifest) error {
 			path)
 	}
 
-	if vol.Name == SPECIAL_LOGS_VOLUME {
+	if vol.Name == RESERVED_LOGS_VOLUME {
 		return fmt.Errorf(
 			"volume name %s is reserved",
 			vol.Name)
@@ -588,6 +715,29 @@ func (d *DesiredState) addVolume(path string, vol *VolumeManifest) error {
 
 	vol.quota = quota
 	d.Volumes[vol.Name] = vol
+
+	return nil
+}
+
+func (d *DesiredState) addSecret(path string, secret *SecretManifest) error {
+	if secret.Name == "" {
+		return fmt.Errorf(
+			"manifest with empty secret name: %v",
+			path)
+	}
+
+	if !(secret.SecretType == SECRET_TYPE_PASSWORD ||
+		secret.SecretType == SECRET_TYPE_TOKEN ||
+		secret.SecretType == SECRET_TYPE_TLS_CERT) {
+		return fmt.Errorf("secret manifest has unknown secretType: %s", secret.SecretType)
+	}
+
+	_, ok := d.Secrets[secret.SecretType][secret.Name]
+	if ok {
+		return fmt.Errorf("duplicate secret name definitions: %s", secret.Name)
+	}
+
+	d.Secrets[secret.SecretType][secret.Name] = secret
 
 	return nil
 }
@@ -616,17 +766,27 @@ func (r *Reconciler) decodeFile(path string, content []byte, desiredState *Desir
 
 	var volume VolumeManifest
 	volumeErr := decoder.Decode(&volume)
-	if volumeErr != nil {
+	if volumeErr == nil {
+		return desiredState.addVolume(path, &volume)
+	}
+
+	decoder = toml.NewDecoder(bytes.NewBuffer(content))
+	decoder.DisallowUnknownFields()
+
+	var secret SecretManifest
+	secretErr := decoder.Decode(&secret)
+	log.Printf("secret err: %v", secretErr)
+	if secretErr != nil {
 		var strictErr *toml.StrictMissingError
 
-		if errors.As(err, &strictErr) {
+		if errors.As(secretErr, &strictErr) {
 			return fmt.Errorf("file %s: %s", path, strictErr.String())
 		}
 
-		return fmt.Errorf("file %s does not seem to be a valid manifest for jail, image or volume, check for typos: %v", path, err)
+		return fmt.Errorf("file %s does not seem to be a valid manifest for jail, image, volume, base or secret; check for typos: %v", path, secretErr)
 	}
 
-	return desiredState.addVolume(path, &volume)
+	return desiredState.addSecret(path, &secret)
 }
 
 func (r *Reconciler) Reconcile() {
@@ -784,6 +944,12 @@ func (r *Reconciler) Reconcile() {
 		}
 
 		manifest.Merge(baseManifest)
+
+		oops.Err(manifest.ValidateJailManifest(manifest.originalHostPath))
+	}
+
+	for _, manifest := range desiredState.Jails {
+		oops.Err(manifest.ApplyMetadata(r.Scm))
 	}
 
 	// order of creation: images, volumes, jails
@@ -802,8 +968,30 @@ func (r *Reconciler) Reconcile() {
 	imagestoDestroy := []string{}
 	jailstoCreate := []*Manifest{}
 	jailstoDestroy := []*Jail{}
+	secretstoDestroy := []*SecretManifest{}
+	secretstoCreate := []*SecretManifest{}
 	existingJailsToRecreate := map[string]bool{}
 	existingJailsToRctl := []*Manifest{}
+
+	for secretType := range desiredState.Secrets {
+		for name, manifest := range desiredState.Secrets[secretType] {
+			_, exists := r.State.Secrets[secretType][name]
+			if exists {
+				continue
+			}
+
+			secretstoCreate = append(secretstoCreate, manifest)
+		}
+	}
+
+	for secretType := range r.State.Secrets {
+		for name, manifest := range r.State.Secrets[secretType] {
+			_, alive := desiredState.Secrets[secretType][name]
+			if !alive {
+				secretstoDestroy = append(secretstoDestroy, manifest)
+			}
+		}
+	}
 
 	for name, manifest := range desiredState.Images {
 		_, exists := r.State.Images[name]
@@ -883,7 +1071,7 @@ func (r *Reconciler) Reconcile() {
 	for _, jail := range jailstoDestroy {
 		ipam, ok := r.Ipam[jail.SubnetId]
 		if !ok {
-			oops.Err(fmt.Errorf("unkown subnet id %s for jails %s", jail.SubnetId, jail.Name))
+			oops.Err(fmt.Errorf("unknown subnet id %s for jails %s", jail.SubnetId, jail.Name))
 			continue
 		}
 
@@ -938,18 +1126,27 @@ func (r *Reconciler) Reconcile() {
 		delete(r.State.Images, image)
 	}
 
+	// destroy secrets
+	for _, secret := range secretstoDestroy {
+		log.Printf("destroying secret %s/%s", secret.SecretType, secret.Name)
+		err = oops.Err(r.Scm.Destroy(secret))
+		if err == nil {
+			delete(r.State.Secrets[secret.SecretType], secret.Name)
+		}
+	}
+
 	// create images
 	for _, manifest := range imagestoCreate {
 		ipam, ok := r.Ipam[manifest.Network.SubnetId]
 		if !ok {
-			oops.Err(fmt.Errorf("unkown subnet id %s for jails %s", manifest.Network.SubnetId, manifest.Name))
-			break
+			oops.Err(fmt.Errorf("unknown subnet id %s for jails %s", manifest.Network.SubnetId, manifest.Name))
+			continue
 		}
 
 		ipAddr, err := ipam.AllocateIP(manifest.Name)
 		if err != nil {
 			oops.Err(err)
-			break
+			continue
 		}
 
 		randomId := make([]byte, 2)
@@ -971,15 +1168,15 @@ func (r *Reconciler) Reconcile() {
 		if err != nil {
 			oops.Err(err)
 			oops.Err(ipam.Free(*ipAddr))
-			break
+			continue
 		}
 
-		err = oops.Err(PrepareJailBeforeStart(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts, r.Config))
+		err = oops.Err(r.PrepareJailBeforeStart(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts))
 		if err != nil {
 			oops.Err(jail.Shutdown())
 			oops.Err(jail.Destroy())
 			oops.Err(ipam.Free(*ipAddr))
-			break
+			continue
 		}
 
 		err = oops.Err(jail.Start())
@@ -987,10 +1184,10 @@ func (r *Reconciler) Reconcile() {
 			oops.Err(jail.Shutdown())
 			oops.Err(jail.Destroy())
 			oops.Err(ipam.Free(*ipAddr))
-			break
+			continue
 		}
 
-		err = oops.Err(PrepareJailAfterStart(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts, r.Config))
+		err = oops.Err(r.PrepareJailAfterStart(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts))
 
 		oops.Err(jail.Shutdown())
 		if err != nil {
@@ -1009,14 +1206,14 @@ func (r *Reconciler) Reconcile() {
 					`volume %s have unlimeted size, this shouldn't happen, it was likely created from the outside.
 						not a good idea to change it's quota size`,
 					volName))
-				break
+				continue
 			}
 
 			if vol.quota < r.State.Volumes[volName].quota {
 				oops.Err(fmt.Errorf(
 					"volume %s max size %v can not be lower than current size %v",
 					volName, vol.quota, r.State.Volumes[volName].quota))
-				break
+				continue
 			}
 
 			if vol.quota > r.State.Volumes[volName].quota {
@@ -1037,7 +1234,7 @@ func (r *Reconciler) Reconcile() {
 
 		if err != nil {
 			oops.Err(err)
-			return
+			continue
 		}
 	}
 
@@ -1046,30 +1243,41 @@ func (r *Reconciler) Reconcile() {
 		ipam, ok := r.Ipam[manifest.Network.SubnetId]
 		if !ok {
 			oops.Err(fmt.Errorf("unknown subnet id %s for jails %s", manifest.Network.SubnetId, manifest.Name))
-			break
+			continue
 		}
 
 		if manifest.Network.StaticIp != "" {
 			ip, err := netip.ParseAddr(manifest.Network.StaticIp)
 			if err != nil {
 				oops.Err(err)
-				break
+				continue
 			}
 
 			err = oops.Err(ipam.Reserve(manifest.Name, ip))
 			if err != nil {
-				break
+				continue
 			}
 		}
 	}
+
+	// create secrets
+	for _, secret := range secretstoCreate {
+		log.Printf("creating secret %s/%s", secret.SecretType, secret.Name)
+		err = oops.Err(r.Scm.Create(secret))
+		if err == nil {
+			r.State.Secrets[secret.SecretType][secret.Name] = secret
+		}
+	}
+
+	oops.Err(r.Scm.Save())
 
 	// create jails
 	for _, manifest := range jailstoCreate {
 		log.Printf("jails will be created %v", manifest.Name)
 		ipam, ok := r.Ipam[manifest.Network.SubnetId]
 		if !ok {
-			oops.Err(fmt.Errorf("unkown subnet id %s for jails %s", manifest.Network.SubnetId, manifest.Name))
-			break
+			oops.Err(fmt.Errorf("unknown subnet id %s for jails %s", manifest.Network.SubnetId, manifest.Name))
+			continue
 		}
 
 		useDynamicIp := false
@@ -1080,13 +1288,13 @@ func (r *Reconciler) Reconcile() {
 			ipAddr, err = netip.ParseAddr(manifest.Network.StaticIp)
 			if err != nil {
 				oops.Err(err)
-				break
+				continue
 			}
 		} else {
 			ip, err := ipam.AllocateIP(manifest.Name)
 			if err != nil {
 				oops.Err(err)
-				break
+				continue
 			}
 
 			ipAddr = *ip
@@ -1094,13 +1302,13 @@ func (r *Reconciler) Reconcile() {
 
 		if err != nil {
 			oops.Err(err)
-			break
+			continue
 		}
 
 		hash, err := manifest.Hash()
 		if err != nil {
 			oops.Err(err)
-			break
+			continue
 		}
 
 		jail, err := NewJail(&JailOptions{
@@ -1118,10 +1326,10 @@ func (r *Reconciler) Reconcile() {
 			if useDynamicIp {
 				oops.Err(ipam.Free(ipAddr))
 			}
-			break
+			continue
 		}
 
-		err = oops.Err(PrepareJailBeforeStart(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts, r.Config))
+		err = oops.Err(r.PrepareJailBeforeStart(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts))
 		if err != nil {
 			oops.Err(err)
 			oops.Err(jail.Shutdown())
@@ -1129,7 +1337,7 @@ func (r *Reconciler) Reconcile() {
 			if useDynamicIp {
 				oops.Err(ipam.Free(ipAddr))
 			}
-			break
+			continue
 		}
 
 		if !manifest.EventSubscription.Empty() {
@@ -1141,7 +1349,7 @@ func (r *Reconciler) Reconcile() {
 				if useDynamicIp {
 					oops.Err(ipam.Free(ipAddr))
 				}
-				break
+				continue
 			}
 		}
 
@@ -1153,7 +1361,7 @@ func (r *Reconciler) Reconcile() {
 			if useDynamicIp {
 				oops.Err(ipam.Free(ipAddr))
 			}
-			break
+			continue
 		}
 
 		err = oops.Err(r.Rctl.Add(jail.Name, manifest.Rlimits))
@@ -1165,10 +1373,10 @@ func (r *Reconciler) Reconcile() {
 				oops.Err(ipam.Free(ipAddr))
 			}
 
-			break
+			continue
 		}
 
-		err = oops.Err(PrepareJailAfterStart(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts, r.Config))
+		err = oops.Err(r.PrepareJailAfterStart(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts))
 		if err != nil {
 			oops.Err(err)
 			oops.Err(jail.Shutdown())
@@ -1517,7 +1725,47 @@ func NewReconcilerOrFail(configPath string) *Reconciler {
 		zfs.CreateSnapshot("releases/15.0-RELEASE", "base", true)
 	}
 
+	var scm *SecretManager
+
+	_, err = os.Stat(SECRETS_FILE)
+	if err != nil {
+		if os.IsNotExist(err) {
+			scm, err = NewSecretManager(SECRETS_FILE)
+			if err != nil {
+				log.Fatal(err)
+			}
+		} else {
+			log.Fatal(err)
+		}
+	} else {
+		scm, err = ImportSecretManager(SECRETS_FILE)
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
 	state := NewState()
+
+	for name := range scm.Inner.Passwords {
+		state.Secrets[SECRET_TYPE_PASSWORD][name] = &SecretManifest{
+			Name:       name,
+			SecretType: SECRET_TYPE_PASSWORD,
+		}
+	}
+
+	for name := range scm.Inner.Tokens {
+		state.Secrets[SECRET_TYPE_TOKEN][name] = &SecretManifest{
+			Name:       name,
+			SecretType: SECRET_TYPE_TOKEN,
+		}
+	}
+
+	for name := range scm.Inner.TlsCerts {
+		state.Secrets[SECRET_TYPE_TLS_CERT][name] = &SecretManifest{
+			Name:       name,
+			SecretType: SECRET_TYPE_TLS_CERT,
+		}
+	}
+
 	existingJails, err := JailListAll()
 	if err != nil {
 		log.Fatal(err)
@@ -1596,6 +1844,7 @@ func NewReconcilerOrFail(configPath string) *Reconciler {
 		Zfs:      zfs,
 		Notifier: NewEventNotifier(10, 5*time.Second),
 		Rctl:     rctl,
+		Scm:      scm,
 		Keypair: Keypair{
 			Priv: privKey,
 			Pub:  pubKey,

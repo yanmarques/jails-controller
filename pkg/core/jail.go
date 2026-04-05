@@ -802,6 +802,38 @@ func (j *Jail) Exec(timeout int, command string, args ...string) error {
 	return err
 }
 
+// callee does verify whether [`dst`] are within jail bounds
+func (j *Jail) CopyContent(content []byte, dst, owner, group string, modeStr string) error {
+	uid, ok := j.UidMaps[owner]
+	if !ok {
+		return fmt.Errorf("unknown owner user %s in jail %s", owner, j.Name)
+	}
+
+	gid, ok := j.GidMaps[group]
+	if !ok {
+		return fmt.Errorf("unknown group %s in jail %s", group, j.Name)
+	}
+
+	hostDestPath := safePathJoin(j.Root, dst)
+	if len(hostDestPath) == 0 {
+		return fmt.Errorf("invalid copy dst path: can not copy outside jail root: %s", dst)
+	}
+
+	mode, err := strconv.ParseUint(modeStr, 8, 32)
+
+	err = os.WriteFile(hostDestPath, content, os.FileMode(mode))
+	if err != nil {
+		return err
+	}
+
+	err = os.Chown(hostDestPath, uid.Id, gid.Id)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
 // caller should verify whether [`src`] is "trusted"
 // callee does verify whether [`dst`] are within jail bounds
 func (j *Jail) Copy(src, dst, owner, group string, modeStr string) error {
