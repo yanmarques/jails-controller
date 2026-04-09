@@ -78,10 +78,25 @@ func (i *IPManager) AllocateIP(consumer string) (*netip.Addr, error) {
 	return &addr, nil
 }
 
+func (i *IPManager) FindAllocation(consumer string) (netip.Addr, error) {
+	for idx := range i.Slots {
+		slot := &i.Slots[idx]
+		if slot.Consumer == consumer && slot.InUse {
+			return slot.IP, nil
+		}
+	}
+
+	return netip.Addr{}, fmt.Errorf("consumer %s did not allocate any ip address", consumer)
+}
+
 func (i *IPManager) Free(ipAddr netip.Addr) error {
 	for idx := range i.Slots {
 		slot := &i.Slots[idx]
 		if slot.IP == ipAddr {
+			if slot.Reserved {
+				return nil
+			}
+
 			slot.InUse = false
 			slot.Timestamp = time.Now()
 			return nil

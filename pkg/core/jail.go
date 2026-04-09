@@ -68,6 +68,7 @@ type Jail struct {
 	Params        JailParams
 	Hints         map[string]string
 	SubnetId      string
+	LogDir        string
 }
 
 type Epair struct {
@@ -231,7 +232,7 @@ func netstatFirstEtherIface(jail string) (*NetstatIface, error) {
 	return nil, nil
 }
 
-func JailImport(name string, zfs *Zfs, zfsMountpoint, zfsSet string) (*JailImportResult, error) {
+func JailImport(name string, zfs *Zfs, zfsMountpoint, zfsSet string, config Config) (*JailImportResult, error) {
 	zfsSource := zfsSet + "/" + name
 	root := filepath.Join(zfsMountpoint, zfsSet, name)
 
@@ -323,6 +324,7 @@ func JailImport(name string, zfs *Zfs, zfsMountpoint, zfsSet string) (*JailImpor
 		Hash:          jailMeta.Hash,
 		Hints:         jailMeta.Hints,
 		SubnetId:      jailMeta.SubnetId,
+		LogDir:        config.LogDir,
 	}
 
 	return &JailImportResult{
@@ -582,6 +584,7 @@ func NewJail(options *JailOptions) (*Jail, error) {
 		Hash:          options.Hash,
 		Hints:         options.Hints,
 		SubnetId:      options.SubnetId,
+		LogDir:        options.Config.LogDir,
 	}, nil
 }
 
@@ -778,6 +781,13 @@ func (j *Jail) Shutdown() error {
 func (j *Jail) Destroy() error {
 	log.Printf("destroying jail %s %s", j.Name, j.ZfsDatasource)
 	err := j.Zfs.Destroy(j.ZfsDatasource, true)
+
+	logErr := os.Remove(filepath.Join(j.LogDir, j.Params["exec.consolelog"]))
+	if logErr != nil {
+		if !os.IsNotExist(logErr) {
+			err = fmt.Errorf("%v: %v", err, logErr)
+		}
+	}
 
 	epairErr := j.Interface.Delete()
 	if epairErr != nil {

@@ -54,6 +54,7 @@ type Reconciler struct {
 	Notifier *LazyEventNotifier
 	Rctl     *JailResourceManager
 	Scm      *SecretManager
+	Pf       *Pf
 	Keypair  Keypair
 	FirstRun bool
 }
@@ -103,6 +104,8 @@ type Config struct {
 	AllowedJailParams []string
 	// Params applied to all jails by default, but overridable
 	DefaultJailParams JailParams
+
+	ExtIf string
 }
 
 type State struct {
@@ -174,6 +177,7 @@ type HasheableManifest struct {
 	EventSubscription EventSubscription
 	Actions           []JailAction
 	Mounts            []JailMount
+	Firewall          []PfPolicy
 	Hints             map[string]string
 }
 
@@ -194,6 +198,7 @@ type Manifest struct {
 	Rlimits           []ResourceLimit
 	Hints             map[string]string
 	Network           NetworkManifest
+	Firewall          []PfPolicy
 
 	// metadata used internally to copy files
 	originalHostPath string
@@ -244,6 +249,7 @@ func (m *Manifest) Hash() (string, error) {
 		Actions:           m.Actions,
 		Mounts:            m.Mounts,
 		Hints:             m.Hints,
+		Firewall:          m.Firewall,
 	}
 
 	out, err := json.Marshal(&manifest)
@@ -460,7 +466,7 @@ func (r *Reconciler) CopyToJail(hostPath string, jail *Jail, action *JailAction)
 				jail.Name, action.Secret, action.SecretType)
 		}
 
-		return jail.CopyContent([]byte(content), action.Dest, action.Owner, action.Group, action.Mode)
+		return jail.CopyContent(content, action.Dest, action.Owner, action.Group, action.Mode)
 	}
 
 	path := safePathJoin(hostPath, action.Src)
@@ -580,6 +586,74 @@ func (m *Manifest) ApplyMetadata(scm *SecretManager) error {
 
 		// jail actions after start are useless
 		m.Actions[idx].BeforeStart = true
+	}
+
+	return nil
+}
+
+func firewallIpAddr(addresses []string, jails map[string]*Jail) ([]string, error) {
+	ipAddresses := []string{}
+
+	for _, addr := range addresses {
+		ipAddr, err := netip.ParseAddr(addr)
+		if err == nil {
+			ipAddresses = append(ipAddresses, ipAddr.String())
+			continue
+		}
+
+		jail, ok := jails[addr]
+		if !ok {
+			return nil, fmt.Errorf("unknown ip address %s", addr)
+		}
+
+		ipAddresses = append(ipAddresses, jail.IpAddr.String())
+	}
+
+	return ipAddresses, nil
+}
+
+func (m *Manifest) AppendFirewallPolicies(jail *Jail, jails map[string]*Jail, policies *[]*PfPolicy) error {
+	if len(m.Firewall) == 0 {
+		*policies = append(*policies, &PfPolicy{
+			Action:    "block",
+			Direction: PF_INGRESS,
+			Interface: jail.Interface.Host,
+			From:      []string{jail.IpAddr.String()},
+		})
+
+		*policies = append(*policies, &PfPolicy{
+			Action:    "block",
+			Direction: PF_EGRESS,
+			Interface: jail.Interface.Host,
+			To:        []string{jail.IpAddr.String()},
+		})
+	} else {
+		for _, pfPolicy := range m.Firewall {
+			pfPolicy.Interface = jail.Interface.Host
+			if pfPolicy.Direction == PF_INGRESS {
+				addresses, err := firewallIpAddr(pfPolicy.From, jails)
+				if err != nil {
+					return err
+				}
+
+				pfPolicy.From = addresses
+				pfPolicy.To = []string{jail.IpAddr.String()}
+
+				// forwarding has inverted direction semantics
+				pfPolicy.Direction = PF_EGRESS
+			} else {
+				addresses, err := firewallIpAddr(pfPolicy.To, jails)
+				if err != nil {
+					return err
+				}
+
+				pfPolicy.To = addresses
+				pfPolicy.From = []string{jail.IpAddr.String()}
+				pfPolicy.Direction = PF_INGRESS
+			}
+
+			*policies = append(*policies, &pfPolicy)
+		}
 	}
 
 	return nil
@@ -972,6 +1046,15 @@ func (r *Reconciler) Reconcile() {
 	secretstoCreate := []*SecretManifest{}
 	existingJailsToRecreate := map[string]bool{}
 	existingJailsToRctl := []*Manifest{}
+	firewall := []*PfPolicy{}
+	imagestoStart := []struct {
+		Jail     *Jail
+		Manifest *Manifest
+	}{}
+	jailstoStart := []struct {
+		Jail     *Jail
+		Manifest *Manifest
+	}{}
 
 	for secretType := range desiredState.Secrets {
 		for name, manifest := range desiredState.Secrets[secretType] {
@@ -1021,6 +1104,8 @@ func (r *Reconciler) Reconcile() {
 			existingJailsToRctl = append(existingJailsToRctl, manifest)
 
 			if existingJail.Hash == manifestHash {
+				oops.Err(manifest.AppendFirewallPolicies(existingJail, r.State.Jails, &firewall))
+
 				continue
 			}
 
@@ -1171,11 +1256,44 @@ func (r *Reconciler) Reconcile() {
 			continue
 		}
 
+		// allow all egress
+		firewall = append(firewall, &PfPolicy{
+			Action:    "pass",
+			Direction: PF_INGRESS,
+			Interface: jail.Interface.Host,
+			From:      []string{jail.IpAddr.String()},
+			Protocol:  []string{"tcp", "udp"},
+			State:     "keep state",
+		})
+
+		imagestoStart = append(imagestoStart, struct {
+			Jail     *Jail
+			Manifest *Manifest
+		}{Jail: jail, Manifest: manifest})
+	}
+
+	if len(imagestoCreate)+len(imagestoDestroy) > 0 {
+		err = oops.Err(r.Pf.SetRules(firewall))
+		if err != nil {
+			return
+		}
+	}
+
+	for _, spec := range imagestoStart {
+		jail := spec.Jail
+		manifest := spec.Manifest
+
+		ipam, ok := r.Ipam[manifest.Network.SubnetId]
+		if !ok {
+			oops.Err(fmt.Errorf("unknown subnet id %s for jails %s", manifest.Network.SubnetId, manifest.Name))
+			continue
+		}
+
 		err = oops.Err(r.PrepareJailBeforeStart(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts))
 		if err != nil {
 			oops.Err(jail.Shutdown())
 			oops.Err(jail.Destroy())
-			oops.Err(ipam.Free(*ipAddr))
+			oops.Err(ipam.Free(jail.IpAddr))
 			continue
 		}
 
@@ -1183,7 +1301,7 @@ func (r *Reconciler) Reconcile() {
 		if err != nil {
 			oops.Err(jail.Shutdown())
 			oops.Err(jail.Destroy())
-			oops.Err(ipam.Free(*ipAddr))
+			oops.Err(ipam.Free(jail.IpAddr))
 			continue
 		}
 
@@ -1192,6 +1310,7 @@ func (r *Reconciler) Reconcile() {
 		oops.Err(jail.Shutdown())
 		if err != nil {
 			oops.Err(jail.Destroy())
+			oops.Err(ipam.Free(jail.IpAddr))
 		} else {
 			r.State.Images[manifest.Name] = manifest.Name
 		}
@@ -1323,20 +1442,45 @@ func (r *Reconciler) Reconcile() {
 		})
 		if err != nil {
 			oops.Err(err)
-			if useDynamicIp {
-				oops.Err(ipam.Free(ipAddr))
-			}
+			oops.Err(ipam.Free(ipAddr))
 			continue
 		}
+
+		err = oops.Err(manifest.AppendFirewallPolicies(jail, r.State.Jails, &firewall))
+		if err != nil {
+			oops.Err(ipam.Free(ipAddr))
+			continue
+		}
+
+		jailstoStart = append(jailstoStart, struct {
+			Jail     *Jail
+			Manifest *Manifest
+		}{Jail: jail, Manifest: manifest})
+	}
+
+	if len(jailstoCreate)+len(jailstoDestroy) > 0 {
+		err = oops.Err(r.Pf.SetRules(firewall))
+		if err != nil {
+			return
+		}
+	}
+
+	for _, spec := range jailstoStart {
+		ipam, ok := r.Ipam[spec.Manifest.Network.SubnetId]
+		if !ok {
+			oops.Err(fmt.Errorf("unknown subnet id %s for jails %s", spec.Manifest.Network.SubnetId, spec.Manifest.Name))
+			continue
+		}
+
+		jail := spec.Jail
+		manifest := spec.Manifest
 
 		err = oops.Err(r.PrepareJailBeforeStart(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts))
 		if err != nil {
 			oops.Err(err)
 			oops.Err(jail.Shutdown())
 			oops.Err(jail.Destroy())
-			if useDynamicIp {
-				oops.Err(ipam.Free(ipAddr))
-			}
+			oops.Err(ipam.Free(jail.IpAddr))
 			continue
 		}
 
@@ -1346,9 +1490,7 @@ func (r *Reconciler) Reconcile() {
 				oops.Err(err)
 				oops.Err(jail.Shutdown())
 				oops.Err(jail.Destroy())
-				if useDynamicIp {
-					oops.Err(ipam.Free(ipAddr))
-				}
+				oops.Err(ipam.Free(jail.IpAddr))
 				continue
 			}
 		}
@@ -1358,9 +1500,7 @@ func (r *Reconciler) Reconcile() {
 			oops.Err(err)
 			oops.Err(jail.Shutdown())
 			oops.Err(jail.Destroy())
-			if useDynamicIp {
-				oops.Err(ipam.Free(ipAddr))
-			}
+			oops.Err(ipam.Free(jail.IpAddr))
 			continue
 		}
 
@@ -1369,9 +1509,7 @@ func (r *Reconciler) Reconcile() {
 			oops.Err(err)
 			oops.Err(jail.Shutdown())
 			oops.Err(jail.Destroy())
-			if useDynamicIp {
-				oops.Err(ipam.Free(ipAddr))
-			}
+			oops.Err(ipam.Free(jail.IpAddr))
 
 			continue
 		}
@@ -1381,9 +1519,7 @@ func (r *Reconciler) Reconcile() {
 			oops.Err(err)
 			oops.Err(jail.Shutdown())
 			oops.Err(jail.Destroy())
-			if useDynamicIp {
-				oops.Err(ipam.Free(ipAddr))
-			}
+			oops.Err(ipam.Free(jail.IpAddr))
 		} else {
 			// add jail to internal state
 			r.State.Jails[jail.Name] = jail
@@ -1591,6 +1727,11 @@ func NewReconcilerOrFail(configPath string) *Reconciler {
 		if err != nil {
 			log.Fatal(err)
 		}
+
+		config.Subnets = append(config.Subnets, Subnet{
+			Id:   "jails",
+			Cidr: DEFAULT_JAIL_CIDR,
+		})
 	}
 
 	_, ok = ipam["images"]
@@ -1599,6 +1740,11 @@ func NewReconcilerOrFail(configPath string) *Reconciler {
 		if err != nil {
 			log.Fatal(err)
 		}
+
+		config.Subnets = append(config.Subnets, Subnet{
+			Id:   "images",
+			Cidr: DEFAULT_IMAGE_CIDR,
+		})
 	}
 
 	repo, err := git.PlainClone(config.Directory, &git.CloneOptions{
@@ -1775,7 +1921,7 @@ func NewReconcilerOrFail(configPath string) *Reconciler {
 
 	hadErrors := false
 	for name := range existingJails {
-		result, err := JailImport(name, zfs, config.ZfsMountpoint, "containers")
+		result, err := JailImport(name, zfs, config.ZfsMountpoint, "containers", config)
 		if err != nil {
 			oops.Err(err)
 			hadErrors = true
@@ -1836,6 +1982,12 @@ func NewReconcilerOrFail(configPath string) *Reconciler {
 		log.Fatal(err)
 	}
 
+	pf := NewPf(config, "/etc/jails-nat.conf", "/etc/jails-filter.conf")
+	err = pf.Init()
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	reconciler := &Reconciler{
 		State:    state,
 		Config:   config,
@@ -1849,6 +2001,7 @@ func NewReconcilerOrFail(configPath string) *Reconciler {
 			Priv: privKey,
 			Pub:  pubKey,
 		},
+		Pf:       pf,
 		FirstRun: true,
 	}
 
