@@ -15,6 +15,7 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"text/template"
@@ -179,6 +180,7 @@ type HasheableManifest struct {
 	Mounts            []JailMount
 	Firewall          []PfPolicy
 	Hints             map[string]string
+	FilesHash         string
 }
 
 type NetworkManifest struct {
@@ -241,6 +243,54 @@ func (m *Manifest) Hash() (string, error) {
 		return "", err
 	}
 
+	filesContent := []byte{}
+	for _, action := range m.Actions {
+		if action.Type != "copy" {
+			continue
+		}
+
+		if action.Src != "" {
+			path := filepath.Join(m.originalHostPath, action.Src)
+			stat, err := os.Stat(path)
+			if err != nil {
+				return "", err
+			}
+
+			if !stat.Mode().IsRegular() {
+				continue
+			}
+
+			if stat.IsDir() {
+				files, err := os.ReadDir(path)
+				if err != nil {
+					return "", err
+				}
+
+				for _, entry := range files {
+					if entry.IsDir() || entry.Type().IsRegular() {
+						continue
+					}
+
+					content, err := os.ReadFile(filepath.Join(path, entry.Name()))
+					if err != nil {
+						return "", err
+					}
+
+					filesContent = slices.Concat(filesContent, content)
+				}
+			} else {
+				content, err := os.ReadFile(path)
+				if err != nil {
+					return "", err
+				}
+
+				filesContent = slices.Concat(filesContent, content)
+			}
+		}
+	}
+
+	digest := sha256.Sum256(filesContent)
+
 	manifest := HasheableManifest{
 		Base:              m.Base,
 		Network:           m.Network,
@@ -250,6 +300,7 @@ func (m *Manifest) Hash() (string, error) {
 		Mounts:            m.Mounts,
 		Hints:             m.Hints,
 		Firewall:          m.Firewall,
+		FilesHash:         hex.EncodeToString(digest[:]),
 	}
 
 	out, err := json.Marshal(&manifest)
@@ -526,6 +577,10 @@ func (m *Manifest) Merge(other *Manifest) {
 
 	for _, rlimit := range other.Rlimits {
 		m.Rlimits = append(m.Rlimits, rlimit)
+	}
+
+	for _, rule := range other.Firewall {
+		m.Firewall = append(m.Firewall, rule)
 	}
 
 	if m.EventSubscription.Empty() {
@@ -1399,11 +1454,9 @@ func (r *Reconciler) Reconcile() {
 			continue
 		}
 
-		useDynamicIp := false
 		var ipAddr netip.Addr
 
 		if manifest.Network.StaticIp != "" {
-			useDynamicIp = true
 			ipAddr, err = netip.ParseAddr(manifest.Network.StaticIp)
 			if err != nil {
 				oops.Err(err)

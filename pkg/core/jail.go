@@ -857,12 +857,12 @@ func (j *Jail) Copy(src, dst, owner, group string, modeStr string) error {
 		return fmt.Errorf("unknown group %s in jail %s", group, j.Name)
 	}
 
-	srcStat, err := os.Stat(src)
+	srcStat, err := os.Lstat(src)
 	if err != nil {
 		return err
 	}
 
-	if !srcStat.Mode().IsRegular() {
+	if srcStat.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("will not copy links: %v", src)
 	}
 
@@ -984,7 +984,7 @@ func (j *Jail) Mount(src, dst, owner, group, modeStr string, readWrite bool, dan
 		}
 	}
 
-	srcStat, err := os.Stat(src)
+	srcStat, err := os.Lstat(src)
 	if err != nil {
 		return err
 	}
@@ -994,7 +994,7 @@ func (j *Jail) Mount(src, dst, owner, group, modeStr string, readWrite bool, dan
 		return err
 	}
 
-	if !dangerousAllowLinks && !srcStat.Mode().IsRegular() {
+	if srcStat.Mode()&os.ModeSymlink != 0 {
 		return fmt.Errorf("will not copy links: %v", src)
 	}
 
