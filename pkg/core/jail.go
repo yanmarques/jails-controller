@@ -29,6 +29,7 @@ var DEFAULT_ALLOWED_JAIL_PARAMS = []string{
 	"exec.jail_user",
 	"stop.timeout",
 	"host.hostname",
+	"sysvshm",
 }
 
 var DEFAULT_JAIL_PARAMS = JailParams{
@@ -610,7 +611,7 @@ func (j *Jail) Start() error {
 
 	if err != nil {
 		shutdownErr := j.Shutdown()
-		destroyErr := j.Destroy()
+		destroyErr := j.Destroy(true)
 
 		if shutdownErr != nil {
 			err = fmt.Errorf("%v: %v", err, shutdownErr)
@@ -626,7 +627,7 @@ func (j *Jail) Start() error {
 	err = j.initNetworking()
 	if err != nil {
 		shutdownErr := j.Shutdown()
-		destroyErr := j.Destroy()
+		destroyErr := j.Destroy(true)
 
 		if shutdownErr != nil {
 			err = fmt.Errorf("%v: %v", err, shutdownErr)
@@ -642,7 +643,19 @@ func (j *Jail) Start() error {
 	return nil
 }
 
-func routeDel(args []string, notExistOk bool) error {
+func routeDel(jail, network, ifname string, notExistOk bool) error {
+	args := []string{}
+
+	if jail != "" {
+		args = append(args, "-j", jail)
+	}
+
+	args = append(args, "del", "-net", network)
+
+	if ifname != "" {
+		args = append(args, "-interface", ifname)
+	}
+
 	_, stderr, err := RunCmd(&CmdOptions{
 		Path: "/sbin/route",
 		Args: args,
@@ -663,15 +676,34 @@ func routeDel(args []string, notExistOk bool) error {
 	return nil
 }
 
-func routeAdd(args []string, existOk bool) error {
+func routeAdd(jail, network, ifname string) error {
+	args := []string{}
+
+	if jail != "" {
+		args = append(args, "-j", jail)
+	}
+
+	args = append(args, "add")
+
+	args = append(args, "-net", network, "-interface", ifname)
 	_, stderr, err := RunCmd(&CmdOptions{
 		Path: "/sbin/route",
 		Args: args,
 	})
 
 	if err != nil {
-		if existOk && bytes.Contains(stderr, []byte("File exists")) {
-			return nil
+		if bytes.Contains(stderr, []byte("File exists")) {
+			err = routeDel(jail, network, "", true)
+			if err != nil {
+				return err
+			}
+
+			_, _, err = RunCmd(&CmdOptions{
+				Path: "/sbin/route",
+				Args: args,
+			})
+
+			return err
 		}
 
 		return err
@@ -708,18 +740,25 @@ func (j *Jail) initNetworking() error {
 		return err
 	}
 
-	err = routeAdd([]string{
-		"-j", j.Name,
-		"add",
-		"-net", DEFAULT_GATEWAY_IP_ADDR + "/32",
-		"-interface", j.Interface.Jail},
-		true,
+	err = routeAdd(
+		j.Name,
+		DEFAULT_GATEWAY_IP_ADDR+"/32",
+		j.Interface.Jail,
 	)
 	if err != nil {
 		return err
 	}
 
-	err = routeAdd([]string{"-j", j.Name, "add", "default", DEFAULT_GATEWAY_IP_ADDR}, true)
+	_, _, err = RunCmd(&CmdOptions{
+		Path: "/sbin/route",
+		Args: []string{
+			"-j",
+			j.Name,
+			"add",
+			"default",
+			DEFAULT_GATEWAY_IP_ADDR,
+		},
+	})
 	if err != nil {
 		return err
 	}
@@ -733,13 +772,13 @@ func (j *Jail) initNetworking() error {
 		return err
 	}
 
-	err = routeAdd([]string{"add", "-net", jailCidr, "-interface", j.Interface.Host}, true)
+	err = routeAdd("", jailCidr, j.Interface.Host)
 	return err
 }
 
 func (j *Jail) teardownNetworking() error {
 	// host side
-	return routeDel([]string{"del", "-net", j.IpAddr.String(), "-interface", j.Interface.Host}, true)
+	return routeDel("", j.IpAddr.String(), j.Interface.Host, true)
 }
 
 func (j *Jail) Shutdown() error {
@@ -778,9 +817,12 @@ func (j *Jail) Shutdown() error {
 	return err
 }
 
-func (j *Jail) Destroy() error {
+func (j *Jail) Destroy(keepFilesystem bool) error {
+	var err error
 	log.Printf("destroying jail %s %s", j.Name, j.ZfsDatasource)
-	err := j.Zfs.Destroy(j.ZfsDatasource, true)
+	if !keepFilesystem {
+		err = j.Zfs.Destroy(j.ZfsDatasource, true)
+	}
 
 	logErr := os.Remove(filepath.Join(j.LogDir, j.Params["exec.consolelog"]))
 	if logErr != nil {
@@ -805,8 +847,9 @@ func (j *Jail) Exec(timeout int, command string, args ...string) error {
 
 	log.Printf("jexec: %v", a)
 	_, _, err := RunCmd(&CmdOptions{
-		Path: "/usr/sbin/jexec",
-		Args: a,
+		Path:    "/usr/sbin/jexec",
+		Args:    a,
+		Timeout: timeout,
 	})
 
 	return err

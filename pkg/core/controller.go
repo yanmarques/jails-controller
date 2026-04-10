@@ -245,7 +245,7 @@ func (m *Manifest) Hash() (string, error) {
 
 	filesContent := []byte{}
 	for _, action := range m.Actions {
-		if action.Type != "copy" {
+		if action.Type != "copy" && action.Type != "template" {
 			continue
 		}
 
@@ -1081,6 +1081,33 @@ func (r *Reconciler) Reconcile() {
 		oops.Err(manifest.ApplyMetadata(r.Scm))
 	}
 
+	// TODO: count restarts
+	existingJails, err := JailListAll()
+	if err != nil {
+		oops.Err(err)
+	} else {
+		for name, jail := range r.State.Jails {
+			_, alive := existingJails[name]
+			if !alive {
+				log.Printf("jail %s died, removing from memory state so it can restart", name)
+				shutdownErr := oops.Err(jail.Shutdown())
+				destroyErr := oops.Err(jail.Destroy(false))
+
+				ipam, ok := r.Ipam[jail.SubnetId]
+				if !ok {
+					oops.Err(fmt.Errorf("unknown subnet id %s for jails %s", jail.SubnetId, jail.Name))
+				} else {
+					err = oops.Err(ipam.Free(jail.IpAddr))
+				}
+
+				if shutdownErr == nil && destroyErr == nil && err == nil {
+					delete(r.State.Jails, name)
+					delete(r.State.Subscribers, name)
+				}
+			}
+		}
+	}
+
 	// order of creation: images, volumes, jails
 	// order of deletion: jails, volumes, images
 
@@ -1227,7 +1254,7 @@ func (r *Reconciler) Reconcile() {
 		err = oops.Err(r.Rctl.DestroyAll(jail.Name))
 		hasErr = hasErr || err != nil
 
-		err = oops.Err(jail.Destroy())
+		err = oops.Err(jail.Destroy(true))
 		hasErr = hasErr || err != nil
 		if !hasErr {
 			delete(r.State.Jails, jail.Name)
@@ -1328,10 +1355,7 @@ func (r *Reconciler) Reconcile() {
 	}
 
 	if len(imagestoCreate)+len(imagestoDestroy) > 0 {
-		err = oops.Err(r.Pf.SetRules(firewall))
-		if err != nil {
-			return
-		}
+		oops.Err(r.Pf.SetRules(firewall))
 	}
 
 	for _, spec := range imagestoStart {
@@ -1341,13 +1365,15 @@ func (r *Reconciler) Reconcile() {
 		ipam, ok := r.Ipam[manifest.Network.SubnetId]
 		if !ok {
 			oops.Err(fmt.Errorf("unknown subnet id %s for jails %s", manifest.Network.SubnetId, manifest.Name))
+			oops.Err(jail.Shutdown())
+			oops.Err(jail.Destroy(false))
 			continue
 		}
 
 		err = oops.Err(r.PrepareJailBeforeStart(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts))
 		if err != nil {
 			oops.Err(jail.Shutdown())
-			oops.Err(jail.Destroy())
+			oops.Err(jail.Destroy(false))
 			oops.Err(ipam.Free(jail.IpAddr))
 			continue
 		}
@@ -1355,7 +1381,7 @@ func (r *Reconciler) Reconcile() {
 		err = oops.Err(jail.Start())
 		if err != nil {
 			oops.Err(jail.Shutdown())
-			oops.Err(jail.Destroy())
+			oops.Err(jail.Destroy(false))
 			oops.Err(ipam.Free(jail.IpAddr))
 			continue
 		}
@@ -1363,10 +1389,11 @@ func (r *Reconciler) Reconcile() {
 		err = oops.Err(r.PrepareJailAfterStart(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts))
 
 		oops.Err(jail.Shutdown())
+		oops.Err(ipam.Free(jail.IpAddr))
 		if err != nil {
-			oops.Err(jail.Destroy())
-			oops.Err(ipam.Free(jail.IpAddr))
+			oops.Err(jail.Destroy(false))
 		} else {
+			oops.Err(jail.Destroy(true))
 			r.State.Images[manifest.Name] = manifest.Name
 		}
 	}
@@ -1501,6 +1528,7 @@ func (r *Reconciler) Reconcile() {
 
 		err = oops.Err(manifest.AppendFirewallPolicies(jail, r.State.Jails, &firewall))
 		if err != nil {
+			oops.Err(jail.Destroy(true))
 			oops.Err(ipam.Free(ipAddr))
 			continue
 		}
@@ -1512,27 +1540,27 @@ func (r *Reconciler) Reconcile() {
 	}
 
 	if len(jailstoCreate)+len(jailstoDestroy) > 0 {
-		err = oops.Err(r.Pf.SetRules(firewall))
-		if err != nil {
-			return
-		}
+		oops.Err(r.Pf.SetRules(firewall))
 	}
 
 	for _, spec := range jailstoStart {
+		jail := spec.Jail
+		manifest := spec.Manifest
+
 		ipam, ok := r.Ipam[spec.Manifest.Network.SubnetId]
 		if !ok {
+			oops.Err(jail.Shutdown())
+			oops.Err(jail.Destroy(true))
+			oops.Err(ipam.Free(jail.IpAddr))
 			oops.Err(fmt.Errorf("unknown subnet id %s for jails %s", spec.Manifest.Network.SubnetId, spec.Manifest.Name))
 			continue
 		}
-
-		jail := spec.Jail
-		manifest := spec.Manifest
 
 		err = oops.Err(r.PrepareJailBeforeStart(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts))
 		if err != nil {
 			oops.Err(err)
 			oops.Err(jail.Shutdown())
-			oops.Err(jail.Destroy())
+			oops.Err(jail.Destroy(true))
 			oops.Err(ipam.Free(jail.IpAddr))
 			continue
 		}
@@ -1542,7 +1570,7 @@ func (r *Reconciler) Reconcile() {
 			if err != nil {
 				oops.Err(err)
 				oops.Err(jail.Shutdown())
-				oops.Err(jail.Destroy())
+				oops.Err(jail.Destroy(true))
 				oops.Err(ipam.Free(jail.IpAddr))
 				continue
 			}
@@ -1552,7 +1580,7 @@ func (r *Reconciler) Reconcile() {
 		if err != nil {
 			oops.Err(err)
 			oops.Err(jail.Shutdown())
-			oops.Err(jail.Destroy())
+			oops.Err(jail.Destroy(true))
 			oops.Err(ipam.Free(jail.IpAddr))
 			continue
 		}
@@ -1561,7 +1589,7 @@ func (r *Reconciler) Reconcile() {
 		if err != nil {
 			oops.Err(err)
 			oops.Err(jail.Shutdown())
-			oops.Err(jail.Destroy())
+			oops.Err(jail.Destroy(true))
 			oops.Err(ipam.Free(jail.IpAddr))
 
 			continue
@@ -1571,7 +1599,7 @@ func (r *Reconciler) Reconcile() {
 		if err != nil {
 			oops.Err(err)
 			oops.Err(jail.Shutdown())
-			oops.Err(jail.Destroy())
+			oops.Err(jail.Destroy(true))
 			oops.Err(ipam.Free(jail.IpAddr))
 		} else {
 			// add jail to internal state
