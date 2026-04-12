@@ -80,19 +80,8 @@ func main() {
 		log.Fatalf("unable to determine the ethernet ip address")
 	}
 
-	header := "$ORIGIN " + *domain + ".\n"
-	header += "$TTL " + strconv.Itoa(*ttl) + "\n"
-	header += `@   IN SOA ns.` + *domain + `. admin.` + *domain + `. (
-        2026040101 ; serial
-        3600       ; refresh
-        600        ; retry
-        86400      ; expire
-        3600       ; minimum
-)
-
-@ IN NS ns.` + *domain + `.
-ns IN A ` + selfIpAddr.String() + `
-`
+	headerTemplate := "$ORIGIN " + *domain + ".\n"
+	headerTemplate += "$TTL " + strconv.Itoa(*ttl) + "\n"
 	var zoneFileMode os.FileMode
 
 	zoneFileStat, err := os.Stat(*zoneFile)
@@ -109,8 +98,6 @@ ns IN A ` + selfIpAddr.String() + `
 
 		zoneFileMode = zoneFileStat.Mode()
 	}
-
-	tmpZoneFile := *zoneFile + ".tmp"
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/notify", func(w http.ResponseWriter, r *http.Request) {
@@ -136,8 +123,21 @@ ns IN A ` + selfIpAddr.String() + `
 			return
 		}
 
+		now := time.Now().Unix()
+
 		var records strings.Builder
-		records.WriteString(header)
+		records.WriteString(headerTemplate)
+		records.WriteString(`@   IN SOA ns.` + *domain + `. admin.` + *domain + `. (
+			` + strconv.FormatInt(now, 10) + ` ; serial
+			3600       ; refresh
+			600        ; retry
+			86400      ; expire
+			3600       ; minimum
+		)
+
+		@ IN NS ns.` + *domain + `.
+		ns IN A ` + selfIpAddr.String() + `
+		`)
 
 		// TODO: validate against invalid names, like ns or admin
 		for _, jail := range event.Jails {
@@ -170,21 +170,14 @@ ns IN A ` + selfIpAddr.String() + `
 
 		newConf := []byte(records.String())
 
-		err = os.WriteFile(tmpZoneFile, newConf, zoneFileMode)
+		err = os.WriteFile(*zoneFile, newConf, zoneFileMode)
 		if err != nil {
-			log.Printf("failed to write to temp zonefile: %v", err)
+			log.Printf("failed to write to zonefile: %v", err)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
 
-		err = os.Rename(tmpZoneFile, *zoneFile)
-		if err != nil {
-			log.Printf("failed to push zonefile: %v", err)
-			w.WriteHeader(http.StatusInternalServerError)
-			return
-		}
-
-		log.Printf("new coredns zonefile applied: %v", event)
+		log.Printf("new coredns zonefile applied")
 		w.WriteHeader(http.StatusNoContent)
 	})
 
