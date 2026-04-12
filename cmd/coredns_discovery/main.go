@@ -128,15 +128,15 @@ func main() {
 		var records strings.Builder
 		records.WriteString(headerTemplate)
 		records.WriteString(`@   IN SOA ns.` + *domain + `. admin.` + *domain + `. (
-			` + strconv.FormatInt(now, 10) + ` ; serial
-			3600       ; refresh
-			600        ; retry
-			86400      ; expire
-			3600       ; minimum
-		)
+	` + strconv.FormatInt(now, 10) + ` ; serial
+	3600       ; refresh
+	600        ; retry
+	86400      ; expire
+	3600       ; minimum
+)
 
-		@ IN NS ns.` + *domain + `.
-		ns IN A ` + selfIpAddr.String() + `
+@ IN NS ns.` + *domain + `.
+ns IN A ` + selfIpAddr.String() + `
 		`)
 
 		// TODO: validate against invalid names, like ns or admin
