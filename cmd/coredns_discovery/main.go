@@ -110,6 +110,8 @@ ns IN A ` + selfIpAddr.String() + `
 		zoneFileMode = zoneFileStat.Mode()
 	}
 
+	tmpZoneFile := *zoneFile + ".tmp"
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("/notify", func(w http.ResponseWriter, r *http.Request) {
 		log.Printf("request: url=%s remote=%s", r.URL, r.RemoteAddr)
@@ -168,9 +170,16 @@ ns IN A ` + selfIpAddr.String() + `
 
 		newConf := []byte(records.String())
 
-		err = os.WriteFile(*zoneFile, newConf, zoneFileMode)
+		err = os.WriteFile(tmpZoneFile, newConf, zoneFileMode)
 		if err != nil {
-			log.Printf("failed to write to zonefile: %v", err)
+			log.Printf("failed to write to temp zonefile: %v", err)
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+
+		err = os.Rename(tmpZoneFile, *zoneFile)
+		if err != nil {
+			log.Printf("failed to push zonefile: %v", err)
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
