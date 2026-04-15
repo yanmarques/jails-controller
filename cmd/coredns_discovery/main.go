@@ -136,8 +136,8 @@ func main() {
 )
 
 @ IN NS ns.` + *domain + `.
-ns IN A ` + selfIpAddr.String() + `
-		`)
+ns IN A ` + selfIpAddr.String())
+		records.WriteByte('\n')
 
 		// TODO: validate against invalid names, like ns or admin
 		for _, jail := range event.Jails {
