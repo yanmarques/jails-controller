@@ -16,17 +16,14 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
-	"sort"
 	"strings"
 	"text/template"
 	"time"
 
 	git "github.com/go-git/go-git/v6"
 	"github.com/go-git/go-git/v6/plumbing"
-	"github.com/go-git/go-git/v6/plumbing/object"
 	"github.com/go-git/go-git/v6/plumbing/transport/http"
 	"github.com/pelletier/go-toml/v2"
-	"golang.org/x/mod/semver"
 )
 
 const DEFAULT_CONFIG_PATH = "/usr/local/etc/jails-controllers.toml"
@@ -87,6 +84,8 @@ type Config struct {
 	RepoUrl string
 	// If repository requires authentication, use this token
 	RepoToken string
+	// Remote branch to clone
+	RepoBranch string
 	// Path inside repo where bastille stuff lives
 	RepoPaths []string
 	// How long to wait between fetching attempts
@@ -1014,70 +1013,24 @@ func (r *Reconciler) NukeJail(jail *Jail) {
 }
 
 func (r *Reconciler) Reconcile() {
-	log.Println("git fetch...")
+	log.Println("reconciling...")
 
-	fakeGit := os.Getenv("FAKE_GIT") == "1"
+	w, err := r.Repo.Worktree()
+	if err != nil {
+		oops.Err(err)
+		return
+	}
 
-	err := r.Repo.Fetch(&git.FetchOptions{
+	err = w.Pull(&git.PullOptions{
 		Auth: &http.BasicAuth{
 			Username: "token",
 			Password: r.Config.RepoToken,
 		},
 	})
-	if err != nil && !errors.Is(err, git.NoErrAlreadyUpToDate) {
-		oops.Err(err)
-	}
-
-	allTags := []object.Tag{}
-	log.Println("git tags...")
-	iter, err := r.Repo.TagObjects()
 	if err != nil {
-		oops.Err(err)
-	} else {
-		err = iter.ForEach(func(tag *object.Tag) error {
-			allTags = append(allTags, *tag)
-			return nil
-		})
-		if err != nil {
-			oops.Err(err)
-		}
-	}
-
-	if len(allTags) == 0 && !fakeGit {
-		log.Println("no tags to reconcile yet")
-		return
-	}
-
-	sort.Slice(allTags, func(i, j int) bool {
-		return semver.Compare(allTags[i].Name, allTags[j].Name) == -1
-	})
-
-	var currentGitTag object.Tag
-	if fakeGit {
-		currentGitTag = object.Tag{
-			Hash: plumbing.NewHash("fake"),
-		}
-	} else {
-		currentGitTag = allTags[len(allTags)-1]
-	}
-
-	if r.State.LastTag == currentGitTag.Hash.String() && !fakeGit {
-		log.Println("up to date")
-		return
-	}
-
-	if !fakeGit {
-		log.Printf("git checkout: %v\n", currentGitTag.Name)
-		w, err := r.Repo.Worktree()
-		if err != nil {
-			oops.Err(err)
-			return
-		}
-
-		err = w.Checkout(&git.CheckoutOptions{
-			Hash: currentGitTag.Hash,
-		})
-		if err != nil {
+		if errors.Is(err, git.NoErrAlreadyUpToDate) {
+			log.Printf("git: already up-to-date")
+		} else {
 			oops.Err(err)
 			return
 		}
@@ -1795,7 +1748,6 @@ func (r *Reconciler) Reconcile() {
 		r.Notifier.RetryFailures(confirmedOnes)
 	}
 
-	r.State.LastTag = currentGitTag.Hash.String()
 	r.FirstRun = false
 }
 
@@ -1949,6 +1901,7 @@ func NewReconcilerOrFail(configPath string) *Reconciler {
 			Username: "token",
 			Password: config.RepoToken,
 		},
+		ReferenceName: plumbing.ReferenceName(config.RepoBranch),
 	})
 
 	if err != nil {
