@@ -831,9 +831,13 @@ func (j *Jail) Destroy(keepFilesystem bool) error {
 		}
 	}
 
-	epairErr := j.Interface.Delete()
-	if epairErr != nil {
-		err = fmt.Errorf("%v: %v", err, epairErr)
+	// only destroy the network interface after destroyed filesystem
+	// this is mostly an issue with how the reconciliation works, which
+	// assumes that while Destroy() returns an error the Jail is not destroyed
+	// yet, so it keep the the jail in the state, meanwhile that interface no
+	// longer exists and may be allocated to other jails
+	if err == nil {
+		oops.Err(j.Interface.Delete())
 	}
 
 	return err

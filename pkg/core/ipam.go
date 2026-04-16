@@ -106,7 +106,44 @@ func (i *IPManager) Free(ipAddr netip.Addr) error {
 	return fmt.Errorf("unknown IP address: %v", ipAddr)
 }
 
-func (i *IPManager) Reserve(consumer string, ipAddr netip.Addr) error {
+func (i *IPManager) Import(consumer string, ipAddr netip.Addr) error {
+	if !i.Network.Contains(ipAddr) {
+		return fmt.Errorf("IP address %v is outside the network: %v", ipAddr.String(), i.Network.String())
+	}
+
+	for idx := range i.Slots {
+		slot := &i.Slots[idx]
+		if slot.IP == ipAddr {
+			if slot.InUse && slot.Consumer != consumer {
+				return fmt.Errorf("ip address %s already in use by %s", ipAddr.String(), consumer)
+			}
+
+			slot.Timestamp = time.Now()
+			slot.InUse = true
+			slot.Reserved = false
+			return nil
+		}
+	}
+
+	if len(i.Slots) > 0 {
+		lastInSlot := i.Slots[i.LastSlot]
+		if ipAddr.Compare(lastInSlot.IP) > 0 {
+			i.LastSlot = len(i.Slots)
+		}
+	}
+
+	i.Slots = append(i.Slots, IPSlot{
+		IP:        ipAddr,
+		InUse:     true,
+		Consumer:  consumer,
+		Timestamp: time.Now(),
+		Reserved:  false,
+	})
+
+	return nil
+}
+
+func (i *IPManager) ReserveStatic(consumer string, ipAddr netip.Addr) error {
 	if !i.Network.Contains(ipAddr) {
 		return fmt.Errorf("IP address %v is outside the network: %v", ipAddr.String(), i.Network.String())
 	}
