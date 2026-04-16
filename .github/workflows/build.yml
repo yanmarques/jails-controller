@@ -1,4 +1,4 @@
-name: Publish binaries
+name: Compile
 
 on:
   push:
@@ -6,7 +6,7 @@ on:
     tags: [ 'v*.*.*' ]
 
 jobs:
-  build:
+  compile:
     runs-on: ubuntu-latest
 
     permissions:
