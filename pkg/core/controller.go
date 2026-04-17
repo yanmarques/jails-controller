@@ -1438,7 +1438,7 @@ func (r *Reconciler) Reconcile() {
 		})
 	}
 
-	if len(imagestoCreate)+len(imagestoDestroy) > 0 {
+	if len(imagestoStart)+len(imagestoDestroy) > 0 {
 		oops.Err(r.Pf.SetRules(firewall))
 	}
 
