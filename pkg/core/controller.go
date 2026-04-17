@@ -2010,7 +2010,7 @@ func NewReconcilerOrFail(configPath string) *Reconciler {
 
 		_, _, err = RunCmd(&CmdOptions{
 			Path:    "/usr/sbin/freebsd-update",
-			Args:    []string{"-b", releasePath, "fetch", "install"},
+			Args:    []string{"--not-running-from-cron", "-b", releasePath, "fetch", "install"},
 			Timeout: DEFAULT_CMD_TIMEOUT_LARGE,
 		})
 		if err != nil {
