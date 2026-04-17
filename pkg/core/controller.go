@@ -203,7 +203,7 @@ type Manifest struct {
 	DependsOn         []string
 
 	// metadata used internally to copy files
-	originalHostPath string
+	searchPaths []string
 }
 
 type VolumeManifest struct {
@@ -298,41 +298,49 @@ func (m *Manifest) Hash() (string, error) {
 			continue
 		}
 
-		path := filepath.Join(m.originalHostPath, action.Src)
-		stat, err := os.Stat(path)
-		if err != nil {
-			return "", err
-		}
-
-		if !stat.Mode().IsRegular() {
-			continue
-		}
-
-		if stat.IsDir() {
-			files, err := os.ReadDir(path)
+		for _, searchPath := range m.searchPaths {
+			path := filepath.Join(searchPath, action.Src)
+			stat, err := os.Stat(path)
 			if err != nil {
-				return "", err
-			}
-
-			for _, entry := range files {
-				if entry.IsDir() || entry.Type().IsRegular() {
-					continue
+				if !os.IsNotExist(err) {
+					oops.Err(err)
 				}
 
-				content, err := os.ReadFile(filepath.Join(path, entry.Name()))
+				continue
+			}
+
+			if !stat.Mode().IsRegular() {
+				continue
+			}
+
+			if stat.IsDir() {
+				files, err := os.ReadDir(path)
+				if err != nil {
+					return "", err
+				}
+
+				for _, entry := range files {
+					if entry.IsDir() || entry.Type().IsRegular() {
+						continue
+					}
+
+					content, err := os.ReadFile(filepath.Join(path, entry.Name()))
+					if err != nil {
+						return "", err
+					}
+
+					filesContent = slices.Concat(filesContent, content)
+				}
+			} else {
+				content, err := os.ReadFile(path)
 				if err != nil {
 					return "", err
 				}
 
 				filesContent = slices.Concat(filesContent, content)
 			}
-		} else {
-			content, err := os.ReadFile(path)
-			if err != nil {
-				return "", err
-			}
 
-			filesContent = slices.Concat(filesContent, content)
+			break
 		}
 	}
 
@@ -413,7 +421,7 @@ func (c JailUserParams) JailParams() (JailParams, error) {
 	return params, nil
 }
 
-func (r *Reconciler) PrepareJailBeforeStart(jail *Jail, hostPath string, actions []JailAction, mounts []JailMount) error {
+func (r *Reconciler) PrepareJailBeforeStart(jail *Jail, searchPaths []string, actions []JailAction, mounts []JailMount) error {
 	var err error
 	// TODO: check for volume existence prior to this
 	for _, mnt := range mounts {
@@ -446,7 +454,7 @@ func (r *Reconciler) PrepareJailBeforeStart(jail *Jail, hostPath string, actions
 				continue
 			}
 
-			err := r.CopyToJail(hostPath, jail, &action)
+			err := r.CopyToJail(searchPaths, jail, &action)
 			if err != nil {
 				return err
 			}
@@ -455,7 +463,7 @@ func (r *Reconciler) PrepareJailBeforeStart(jail *Jail, hostPath string, actions
 				continue
 			}
 
-			err := r.TemplateToJail(hostPath, jail, &action)
+			err := r.TemplateToJail(searchPaths, jail, &action)
 			if err != nil {
 				return err
 			}
@@ -471,7 +479,7 @@ func (r *Reconciler) PrepareJailBeforeStart(jail *Jail, hostPath string, actions
 	return nil
 }
 
-func (r *Reconciler) PrepareJailAfterStart(jail *Jail, hostPath string, actions []JailAction, mounts []JailMount) error {
+func (r *Reconciler) PrepareJailAfterStart(jail *Jail, searchPaths []string, actions []JailAction, mounts []JailMount) error {
 	for _, action := range actions {
 		switch action.Type {
 		case "exec":
@@ -489,7 +497,7 @@ func (r *Reconciler) PrepareJailAfterStart(jail *Jail, hostPath string, actions 
 				continue
 			}
 
-			err := r.CopyToJail(hostPath, jail, &action)
+			err := r.CopyToJail(searchPaths, jail, &action)
 			if err != nil {
 				return err
 			}
@@ -498,7 +506,7 @@ func (r *Reconciler) PrepareJailAfterStart(jail *Jail, hostPath string, actions 
 				continue
 			}
 
-			err := r.TemplateToJail(hostPath, jail, &action)
+			err := r.TemplateToJail(searchPaths, jail, &action)
 			if err != nil {
 				return err
 			}
@@ -514,34 +522,41 @@ func (r *Reconciler) PrepareJailAfterStart(jail *Jail, hostPath string, actions 
 	return nil
 }
 
-func (r *Reconciler) TemplateToJail(hostPath string, jail *Jail, action *JailAction) error {
+func (r *Reconciler) TemplateToJail(searchPaths []string, jail *Jail, action *JailAction) error {
 	template := template.New("jail action")
 
-	path := safePathJoin(hostPath, action.Src)
-	if len(path) == 0 {
-		return fmt.Errorf("invalid copy src path: can not copy outside manifest path: %s", action.Src)
+	for _, searchPath := range searchPaths {
+		path := safePathJoin(searchPath, action.Src)
+		if len(path) == 0 {
+			return fmt.Errorf("invalid copy src path: can not copy outside manifest path: %s", action.Src)
+		}
+
+		content, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+
+		tmpl, err := template.Parse(string(content))
+		if err != nil {
+			return err
+		}
+
+		var buffer bytes.Buffer
+		err = tmpl.Execute(&buffer, r.Scm.Inner)
+		if err != nil {
+			return err
+		}
+
+		err = oops.Err(jail.CopyContent(buffer.Bytes(), action.Dest, action.Owner, action.Group, action.Mode))
+		if err == nil {
+			return nil
+		}
 	}
 
-	content, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-
-	tmpl, err := template.Parse(string(content))
-	if err != nil {
-		return err
-	}
-
-	var buffer bytes.Buffer
-	err = tmpl.Execute(&buffer, r.Scm.Inner)
-	if err != nil {
-		return err
-	}
-
-	return jail.CopyContent(buffer.Bytes(), action.Dest, action.Owner, action.Group, action.Mode)
+	return fmt.Errorf("unable to find file for action src %s", action.Src)
 }
 
-func (r *Reconciler) CopyToJail(hostPath string, jail *Jail, action *JailAction) error {
+func (r *Reconciler) CopyToJail(searchPaths []string, jail *Jail, action *JailAction) error {
 	if action.Secret != "" && action.Src != "" {
 		return fmt.Errorf("action src and secret defined, specify one not both, src=%s and secret=%s",
 			action.Src, action.Secret)
@@ -567,12 +582,19 @@ func (r *Reconciler) CopyToJail(hostPath string, jail *Jail, action *JailAction)
 		return jail.CopyContent(content, action.Dest, action.Owner, action.Group, action.Mode)
 	}
 
-	path := safePathJoin(hostPath, action.Src)
-	if len(path) == 0 {
-		return fmt.Errorf("invalid copy src path: can not copy outside manifest path: %s", action.Src)
+	for _, searchPath := range searchPaths {
+		path := safePathJoin(searchPath, action.Src)
+		if len(path) == 0 {
+			return fmt.Errorf("invalid copy src path: can not copy outside manifest path: %s", action.Src)
+		}
+
+		err := oops.Err(jail.Copy(path, action.Dest, action.Owner, action.Group, action.Mode))
+		if err == nil {
+			return nil
+		}
 	}
 
-	return jail.Copy(path, action.Dest, action.Owner, action.Group, action.Mode)
+	return fmt.Errorf("unable to find file for action src %s", action.Src)
 }
 
 func NewDesiredState() *DesiredState {
@@ -642,6 +664,10 @@ func (m *Manifest) Merge(other *Manifest) {
 	if m.Network.StaticIp == "" {
 		m.Network.StaticIp = other.Network.StaticIp
 	}
+
+	for _, searchPath := range other.searchPaths {
+		m.searchPaths = append(m.searchPaths, searchPath)
+	}
 }
 
 func (m *Manifest) ApplyMetadata(scm *SecretManager) error {
@@ -655,14 +681,30 @@ func (m *Manifest) ApplyMetadata(scm *SecretManager) error {
 		var err error
 
 		if m.EventSubscription.ServerCertPath != "" {
-			serverCertPath := safePathJoin(filepath.Dir(m.originalHostPath), m.EventSubscription.ServerCertPath)
-			if serverCertPath == "" {
-				return fmt.Errorf("invalid server cert path %s: can not copy outside m m: %s",
-					m.EventSubscription.ServerCertPath, m.Name)
+			var err error
+			found := false
+
+			for _, searchPath := range m.searchPaths {
+				serverCertPath := safePathJoin(filepath.Dir(searchPath), m.EventSubscription.ServerCertPath)
+				if serverCertPath == "" {
+					return fmt.Errorf("invalid server cert path %s: can not copy outside m m: %s",
+						m.EventSubscription.ServerCertPath, m.Name)
+				}
+
+				content, err = os.ReadFile(serverCertPath)
+				if err == nil {
+					found = true
+					break
+				}
+
+				oops.Err(err)
 			}
 
-			content, err = os.ReadFile(serverCertPath)
-			if err != nil {
+			if !found {
+				if err == nil {
+					err = fmt.Errorf("no such file or directory: %s", m.EventSubscription.ServerCertPath)
+				}
+
 				return err
 			}
 		} else {
@@ -787,11 +829,11 @@ func (m *Manifest) AppendFirewallPolicies(jail *Jail, a map[string]*Jail, b map[
 	return nil
 }
 
-func (m *Manifest) ValidateJailManifest(path string) error {
+func (m *Manifest) ValidateJailManifest(searchPaths []string) error {
 	if m.Name == "" {
 		return fmt.Errorf(
 			"manifest with empty name, ignoring: %v",
-			path)
+			searchPaths)
 	}
 
 	if m.EventSubscription.ServerPort <= 0 && !m.EventSubscription.Empty() {
@@ -826,7 +868,7 @@ func (m *Manifest) ValidateJailManifest(path string) error {
 }
 
 func (d *DesiredState) addBaseManifest(path string, manifest *Manifest) error {
-	err := manifest.ValidateJailManifest(path)
+	err := manifest.ValidateJailManifest([]string{path})
 	if err != nil {
 		return err
 	}
@@ -836,14 +878,14 @@ func (d *DesiredState) addBaseManifest(path string, manifest *Manifest) error {
 		return fmt.Errorf("duplicate base name definitions: %s", manifest.Name)
 	}
 
-	manifest.originalHostPath = filepath.Dir(path)
+	manifest.searchPaths = append(manifest.searchPaths, filepath.Dir(path))
 	d.BaseManifests[manifest.Name] = manifest
 
 	return nil
 }
 
 func (d *DesiredState) addJail(path string, jail *Manifest) error {
-	err := jail.ValidateJailManifest(path)
+	err := jail.ValidateJailManifest([]string{path})
 	if err != nil {
 		return err
 	}
@@ -853,7 +895,7 @@ func (d *DesiredState) addJail(path string, jail *Manifest) error {
 		return fmt.Errorf("duplicate jail name definitions: %s", jail.Name)
 	}
 
-	jail.originalHostPath = filepath.Dir(path)
+	jail.searchPaths = append(jail.searchPaths, filepath.Dir(path))
 	d.Jails[jail.Name] = jail
 
 	return nil
@@ -880,7 +922,7 @@ func (d *DesiredState) addImage(path string, image *Manifest) error {
 		image.Mounts = []JailMount{}
 	}
 
-	image.originalHostPath = filepath.Dir(path)
+	image.searchPaths = append(image.searchPaths, filepath.Dir(path))
 	d.Images[image.Name] = image
 
 	return nil
@@ -1123,7 +1165,7 @@ func (r *Reconciler) Reconcile() {
 
 		manifest.Merge(baseManifest)
 
-		oops.Err(manifest.ValidateJailManifest(manifest.originalHostPath))
+		oops.Err(manifest.ValidateJailManifest(manifest.searchPaths))
 	}
 
 	for _, manifest := range desiredState.Jails {
@@ -1411,7 +1453,7 @@ func (r *Reconciler) Reconcile() {
 			continue
 		}
 
-		err = oops.Err(r.PrepareJailBeforeStart(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts))
+		err = oops.Err(r.PrepareJailBeforeStart(jail, manifest.searchPaths, manifest.Actions, manifest.Mounts))
 		if err != nil {
 			jailsPendingDeletion = append(jailsPendingDeletion, jail)
 			continue
@@ -1423,7 +1465,7 @@ func (r *Reconciler) Reconcile() {
 			continue
 		}
 
-		err = oops.Err(r.PrepareJailAfterStart(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts))
+		err = oops.Err(r.PrepareJailAfterStart(jail, manifest.searchPaths, manifest.Actions, manifest.Mounts))
 
 		shutdownErr := oops.Err(jail.Shutdown())
 		freeIpErr := oops.Err(ipam.Free(jail.IpAddr))
@@ -1635,7 +1677,7 @@ func (r *Reconciler) Reconcile() {
 		jail := spec.Jail
 		manifest := spec.Manifest
 
-		err = oops.Err(r.PrepareJailBeforeStart(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts))
+		err = oops.Err(r.PrepareJailBeforeStart(jail, manifest.searchPaths, manifest.Actions, manifest.Mounts))
 		if err != nil {
 			jailsPendingDeletion = append(jailsPendingDeletion, jail)
 			continue
@@ -1662,7 +1704,7 @@ func (r *Reconciler) Reconcile() {
 			continue
 		}
 
-		err = oops.Err(r.PrepareJailAfterStart(jail, manifest.originalHostPath, manifest.Actions, manifest.Mounts))
+		err = oops.Err(r.PrepareJailAfterStart(jail, manifest.searchPaths, manifest.Actions, manifest.Mounts))
 		if err != nil {
 			jailsPendingDeletion = append(jailsPendingDeletion, jail)
 		} else {
