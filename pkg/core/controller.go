@@ -744,6 +744,11 @@ func firewallDependentJails(jailName string, addresses []string, a map[string]*J
 			continue
 		}
 
+		_, err = netip.ParsePrefix(addr)
+		if err == nil {
+			continue
+		}
+
 		_, ok := a[addr]
 		if !ok {
 			_, ok = b[addr]
@@ -765,6 +770,12 @@ func firewallIpAddr(jailName string, addresses []string, a map[string]*Jail, b m
 		ipAddr, err := netip.ParseAddr(addr)
 		if err == nil {
 			ipAddresses = append(ipAddresses, ipAddr.String())
+			continue
+		}
+
+		ipPrefix, err := netip.ParsePrefix(addr)
+		if err == nil {
+			ipAddresses = append(ipAddresses, ipPrefix.String())
 			continue
 		}
 
@@ -1669,7 +1680,7 @@ func (r *Reconciler) Reconcile() {
 		oops.Err(spec.Manifest.AppendFirewallPolicies(spec.Jail, r.State.Jails, jailstoStartB, &firewall))
 	}
 
-	if len(jailstoCreate)+len(jailstoDestroy) > 0 {
+	if r.FirstRun || len(jailstoCreate)+len(jailstoDestroy) > 0 {
 		oops.Err(r.Pf.SetRules(firewall))
 	}
 
