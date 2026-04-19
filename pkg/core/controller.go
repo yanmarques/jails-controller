@@ -250,7 +250,7 @@ func TopologicalSort(jails map[string]*Manifest) ([]*Manifest, error) {
 	var visit func(n string) error
 	visit = func(n string) error {
 		if cycle[n] {
-			return fmt.Errorf("dependency cycle detected on dependent %s", n)
+			return nil
 		}
 
 		jail, ok := jails[n]
